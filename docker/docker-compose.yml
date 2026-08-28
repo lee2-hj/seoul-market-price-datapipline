@@ -1,0 +1,190 @@
+# =====================================================================
+# 통합 docker-compose.yml
+#   - C:\taxi-data-plarform\docker\docker-compose.yml (MySQL, Postgres, MinIO)
+#   - C:\팀 프로젝트\dataengineer\docker\docker-compose.yml (MinIO, ES/Kibana, Iceberg)
+#   두 파일을 하나로 병합한 결과입니다. (2026-08-06 정리)
+#
+# Airflow는 이 파일에서 분리되어 ../airflow/docker-compose.yaml (공식 Airflow 배포판)로 관리됩니다.
+# 두 compose 스택은 아래에서 만드는 외부 네트워크 dataeng-net으로 서로 연결됩니다.
+#
+# 최초 1회, 두 스택을 올리기 전에 네트워크를 미리 만들어두세요:
+#   docker network create dataeng-net
+#
+# [데이터 보존 안내]
+#   - minio_data, es_data, labdb_data 볼륨은 이 파일이 있는 폴더명(docker)을 프로젝트명으로
+#     사용해 기존과 동일한 이름(docker_minio_data, docker_es_data, docker_labdb_data)으로
+#     재사용됩니다.
+#   - mysql_data 볼륨은 external: true 로, 이미 별도로 생성되어 있는 볼륨을 그대로 참조합니다.
+#   - 네 볼륨 모두 이름을 변경하지 않았으므로 down/up -d 반복 시 데이터가 유지됩니다.
+#
+# [환경 변수 안내]
+#   - 모든 값은 프로젝트 루트의 env/.env 하나로 통합되어 있습니다 (docker/.env는 폐기).
+#   - docker-compose는 ${VAR} 치환을 이 파일과 같은 폴더의 .env에서만 자동으로 읽으므로,
+#     반드시 --env-file 로 경로를 지정해서 실행하세요:
+#       docker compose --env-file ../env/.env up -d
+#     매번 옵션을 치기 번거로우면 같은 폴더의 compose.bat 래퍼를 쓰세요:
+#       compose.bat up -d
+#   - MinIO 루트 계정: 아래 environment: 블록의 MINIO_ROOT_USER/MINIO_ROOT_PASSWORD/
+#     AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY라는 "왼쪽 이름"은 각각 minio/mc 공식
+#     이미지와 AWS SDK가 컨테이너 안에서 고정적으로 찾는 이름이라 바꿀 수 없다. 대신
+#     그 값을 채우는 "오른쪽 ${...} 치환"은 env/.env의 S3_ACCESS_KEY/S3_SECRET_KEY를
+#     그대로 읽어오도록 통일했다(과거에는 별도의 MINIO_ROOT_USER/PASSWORD 값을 .env에
+#     중복으로 두고 관리했다 - 2026-08-21 정리).
+# =====================================================================
+
+services:
+  # ── MinIO (S3 호환 오브젝트 스토리지) ───────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    env_file:
+      - ../env/.env
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
+    ports:
+      # 0.0.0.0 바인딩 (기본값) -> 같은 네트워크의 팀원 PC에서 <내 PC IP>:포트 로 접속 가능
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # 웹 콘솔
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [dataeng-net]
+
+  minio-createbuckets:
+    image: minio/mc:latest
+    container_name: minio-init
+    env_file:
+      - ../env/.env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin123};
+      mc mb -p local/lake;
+      mc mb -p local/warehouse;
+      exit 0;
+      "
+    networks: [dataeng-net]
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    env_file:
+      - ../env/.env
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-createbuckets:
+        condition: service_completed_successfully
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-minioadmin123}
+      AWS_REGION: us-east-1
+    ports:
+      # 로컬 venv에서 http://<내 PC IP>:8181 로 카탈로그 접속 가능
+      - "8181:8181"
+    restart: unless-stopped
+    networks: [dataeng-net]
+
+  # ── Elasticsearch / Kibana (로그·검색) ──────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: elasticsearch
+    env_file:
+      - ../env/.env
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      # 팀원 PC/BI 툴에서 http://<내 PC IP>:9200 으로 접속 가능
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [dataeng-net]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.3
+    container_name: kibana
+    env_file:
+      - ../env/.env
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      # 팀원 PC에서 http://<내 PC IP>:5601 로 접속 가능
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [dataeng-net]
+
+  # ── MySQL (taxi-data-platform 운영 DB) ──────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: local-mysql
+    restart: always
+    env_file:
+      - ../env/.env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - '${MYSQL_BIND_IP}:${MYSQL_BIND_PORT}:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  # ── Postgres (실습/랩용 DB) ──────────────────────────────
+  postgres:
+    image: postgres:16
+    ports: ['5432:5432']
+    env_file:
+      - ../env/.env
+    environment:
+      POSTGRES_USER: student
+      POSTGRES_PASSWORD: student1234
+      POSTGRES_DB: labdb
+    volumes:
+      - labdb_data:/var/lib/postgresql/data
+
+volumes:
+  minio_data:
+  es_data:
+  mysql_data:
+    external: true
+  labdb_data:
+
+networks:
+  dataeng-net:
+    external: true
+    name: dataeng-net

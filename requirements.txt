@@ -1,0 +1,10 @@
+python-dotenv
+pyyaml
+requests
+pytest
+duckdb
+polars
+pyarrow
+pyspark==4.0.4
+pydantic-settings
+elasticsearch>=8.14,<9

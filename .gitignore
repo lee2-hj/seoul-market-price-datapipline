@@ -1,0 +1,44 @@
+# Data & logs (구조만 유지, 내용물은 추적하지 않음)
+data/raw/*
+data/interim/*
+data/processed/*
+data/external/*
+!data/**/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Airflow 공식 docker-compose가 airflow/ 밑에 만드는 런타임 폴더
+airflow/logs/
+airflow/plugins/*
+!airflow/plugins/.gitkeep
+airflow/config/*
+!airflow/config/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env / secrets
+.env
+*.env.local
+docker/.env
+airflow/.env
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+ 
+# Temp/Tool 
+.airflow_home_tmp/ 
+.claude/ 
