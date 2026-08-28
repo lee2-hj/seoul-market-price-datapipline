@@ -132,7 +132,7 @@ spark = (
     .config("spark.sql.catalog.lakehouse.type", "hadoop")
     .config("spark.sql.catalog.lakehouse.warehouse", LAKE_WAREHOUSE)
     .config("spark.sql.catalog.lakehouse.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-    .config("spark.sql.catalog.lakehouse.s3.endpoint", ENDPOINT_CLEAN)
+    .config("spark.sql.catalog.lakehouse.s3.endpoint", S3_ENDPOINT_URL)
     .config("spark.sql.catalog.lakehouse.s3.path-style-access", "true")
     .config("spark.sql.catalog.lakehouse.s3.access-key-id", S3_ACCESS_KEY)
     .config("spark.sql.catalog.lakehouse.s3.secret-access-key", S3_SECRET_KEY)
