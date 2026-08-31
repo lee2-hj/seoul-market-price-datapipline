@@ -48,10 +48,41 @@ PYEONG_M2 = 3.30578          # 1평 = 3.30578 m2 (전용면적 기준 평수 환
 
 # dim_apartment는 파티션이 없어 data/ 밑에 바로 parquet이 있고, fact_apt_transactions는
 # Iceberg 테이블 생성 시 PARTITIONED BY (days(deal_date))로 만들어져 있어(Real_Estate_Transform.py
-# 참고) data/deal_date_day=YYYY-MM-DD/*.parquet 형태로 중첩되어 있다 - 재귀 글롭(**)이 필요하다
-# (pipeline_apt_name.py의 DIM_APARTMENT_GLOB/FACT_APT_TRANSACTIONS_GLOB와 동일한 규칙).
+# 참고) data/deal_date_day=YYYY-MM-DD/*.parquet 형태로 중첩되어 있다.
 DIM_APARTMENT_GLOB = "dim_apartment/data/*.parquet"
-FACT_APT_TRANSACTIONS_GLOB = "fact_apt_transactions/data/**/*.parquet"
+
+# [2026-08-30 SIGABRT 장애 대응] 예전에는 재귀 글롭(fact_apt_transactions/data/**/*.parquet)으로
+# 90일 전체를 한 번의 read_parquet 호출로 긁어와 WHERE deal_date_day BETWEEN ... 으로만 걸렀다.
+# 이 방식은 "행 수를 줄이는" 필터일 뿐, 90일치 조인 결과(이번 장애 기준 1,296만 행) 전체가
+# raw_df -> mart_df(파생컬럼 추가본과 raw_df가 동시에 생존) -> partition_by()가 만드는 90개
+# 파티션 복사본까지, 같은 규모의 데이터가 최대 3벌 가까이 한꺼번에 메모리에 떠 있는 구조였다.
+# Airflow가 이 프로세스에 걸어둔 RLIMIT_AS(가상메모리 하드캡, data_orchestration.py의
+# _DUCKDB_MEMORY_LIMIT_MB=4608MB)를 Rust 기반 Polars 할당자가 들이받고
+# `memory allocation of N bytes failed` + SIGABRT로 즉사한 사고가 실제로 발생했다(1,296만
+# 행 규모에서 재현됨) - 커널 OOM killer의 SIGKILL이 아니라, 사고 범위를 이 프로세스 하나로
+# 좁히기 위해 의도적으로 걸어둔 RLIMIT_AS가 "설계대로" 발동한 것이었다.
+# 근본 대책: fetch 자체를 하루 단위(day() 파티션 디렉터리 하나)로 쪼갠다. 이 마트는 어차피
+# base_date(=하루) 단위로 upsert_partition()을 도는 구조라, "조회도 하루 단위로" 맞추면
+# 한 시점에 메모리에 떠 있는 데이터가 평균 90분의 1(하루치, 약 14만 행 수준)로 줄어들어
+# 3벌씩 겹쳐도 예전 1회분보다 훨씬 작다. 부수 효과로 S3 listing도 재귀 글롭 1회(90개
+# 디렉터리 전체 나열) 대신 그날 디렉터리 하나만 직접 지정해 오히려 더 가볍다.
+FACT_APT_TRANSACTIONS_DAY_GLOB = "fact_apt_transactions/data/deal_date_day={day}/*.parquet"
+
+# 위 상수 도입 전 컬럼 스키마(SELECT 목록)는 그대로 재사용하므로, 조회 시 필요한 컬럼 목록만
+# 별도 상수로 뽑아 fetch_joined_day()가 매 호출(=매일)마다 동일하게 참조하게 한다.
+_RAW_SELECT_COLUMNS = """
+    d.sgg_cd  AS sgg_cd,
+    d.sgg_nm  AS sgg_nm,
+    d.dong_cd AS dong_cd,
+    d.dong_nm AS dong_nm,
+    d.apt_name AS apt_name,
+    f.mno AS mno,
+    f.sno AS sno,
+    f.deal_date AS deal_date,
+    f.floor AS floor,
+    f.price_ten_thousand AS price_ten_thousand,
+    f.exclusive_area_m2 AS exclusive_area_m2
+"""
 
 # 최종 마트 이름/저장 경로: {S3_END_POINT}/{LAKE}/mart/RTT/base_date=YYYY-MM-DD/data.parquet
 # 파일명을 고정값(PARTITION_FILE_NAME)으로 둬서, 같은 base_date를 몇 번을 다시 써도(Update)
@@ -175,50 +206,40 @@ def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: st
 
 # =====================================================================================
 # 4. fact_apt_transactions 조회 - Predicate/Projection Pushdown + Broadcast Join
-#    - Predicate Pushdown: WHERE 절의 deal_date_day 조건이 fact_apt_transactions의 실제 물리
-#      파티션 디렉터리(data/deal_date_day=YYYY-MM-DD/)와 일치하므로, DuckDB가 파티션 값 자체로
-#      디렉터리 단위 스킵(파티션 프루닝)을 수행한다. deal_date(파티션 컬럼과 별개의 일반
-#      컬럼)만으로 걸렀다면 파일을 일단 열어 row-group 통계로만 걸러지므로, 굳이 파티션
-#      컬럼(deal_date_day)을 기준으로 필터링해 디렉터리 단위로 먼저 잘라낸다.
+#    - [2026-08-30 SIGABRT 장애 대응] 90일 전체를 한 번에 조회하던 이전 방식(fetch_joined_raw)은
+#      1,300만 행 규모에서 raw_df/mart_df/partition_by() 복사본이 동시에 메모리에 떠 있다가
+#      RLIMIT_AS를 넘겨 죽었다(모듈 상단 FACT_APT_TRANSACTIONS_DAY_GLOB 주석 참고). 이제는
+#      하루(day() 파티션 디렉터리 하나)만 조회한다 - main()이 90일을 순회하며 하루치씩 호출한다.
+#    - 디렉터리 자체를 하루 단위로 직접 지정하므로("파티션 프루닝"이 아니라 애초에 그 디렉터리
+#      하나만 나열/오픈), 재귀 글롭(**)으로 90개 디렉터리를 매번 다시 나열하지 않아도 된다.
 #    - Projection Pushdown: 서브쿼리에서 실제로 쓰는 컬럼만 SELECT해, 파케이 파일에서 그
 #      컬럼들만 읽어오게 한다(price_per_m2/deal_type/agent_sgg_nm 등은 애초에 읽지 않음).
 #      mno/sno는 레코드 고유 키(KEY_COLUMNS) 구성에 필요해 함께 선택한다.
-#    - Broadcast Join: 위 3번에서 구체화해둔 dim_apartment_bc(작은 build side)에 fact(필터링/
-#      프로젝션이 끝난 큰 쪽)를 INNER JOIN한다 - 조인 키(sgg_cd, dong_cd, apt_name) 기준.
+#    - Broadcast Join: 위 3번에서 구체화해둔 dim_apartment_bc(작은 build side, 90일 전체 순회
+#      동안 재사용)에 fact(필터링/프로젝션이 끝난 하루치)를 INNER JOIN한다 - 조인 키(sgg_cd,
+#      dong_cd, apt_name) 기준.
 #    - union_by_name=true: Iceberg 메타데이터 없이 원본 parquet을 직접 글롭하는 방식이라,
 #      과거에 스키마가 바뀐 적 있는 옛 파일과 컬럼 구성이 다를 수 있음을 관대하게 처리한다
 #      (pipeline_apt_name.py의 fact_apt_transactions 조회와 동일한 이유).
-#    - 90일 구간 전체를 한 번의 쿼리로 가져온다(파티션마다 재조회하지 않음) - 이후 5번에서
-#      Polars가 base_date(=deal_date)별로 인메모리 분할해 파티션 단위 Upsert에 넘긴다.
+#    - 해당 날짜에 거래가 아예 없어 파티션 디렉터리 자체가 생성되지 않은 경우(S3에 그
+#      deal_date_day= 경로가 없음), DuckDB가 IOException을 던진다 - 빈 결과(0건)로 간주하고
+#      넘어간다(read_existing_partition()의 예외 처리와 동일한 패턴).
 # =====================================================================================
-def fetch_joined_raw(
+def fetch_joined_day(
     con: duckdb.DuckDBPyConnection,
     lake_bucket: str,
-    as_of_date,
-    start_date,
+    day_str: str,
 ) -> pl.DataFrame:
-    fact_s3_path = f"s3://{lake_bucket}/{FACT_APT_TRANSACTIONS_GLOB}"
+    fact_s3_path = f"s3://{lake_bucket}/{FACT_APT_TRANSACTIONS_DAY_GLOB.format(day=day_str)}"
     query = f"""
         SELECT
-            d.sgg_cd  AS sgg_cd,
-            d.sgg_nm  AS sgg_nm,
-            d.dong_cd AS dong_cd,
-            d.dong_nm AS dong_nm,
-            d.apt_name AS apt_name,
-            f.mno AS mno,
-            f.sno AS sno,
-            f.deal_date AS deal_date,
-            f.floor AS floor,
-            f.price_ten_thousand AS price_ten_thousand,
-            f.exclusive_area_m2 AS exclusive_area_m2
+            {_RAW_SELECT_COLUMNS}
         FROM (
             SELECT
                 sgg_cd, dong_cd, apt_name, mno, sno,
                 deal_date, floor, price_ten_thousand, exclusive_area_m2
             FROM read_parquet('{fact_s3_path}', union_by_name=true)
-            WHERE deal_date_day >= DATE '{start_date}'
-              AND deal_date_day <= DATE '{as_of_date}'
-              AND (cancel_date IS NULL OR TRIM(cancel_date) = '')
+            WHERE (cancel_date IS NULL OR TRIM(cancel_date) = '')
               AND price_ten_thousand > 0
               AND exclusive_area_m2 > 0
         ) AS f
@@ -227,8 +248,14 @@ def fetch_joined_raw(
            AND f.dong_cd = d.dong_cd
            AND f.apt_name = d.apt_name
     """
-    print(f"[INFO] fact_apt_transactions 조회(필터+브로드캐스트 조인): {fact_s3_path}")
-    return con.execute(query).pl()
+    try:
+        return con.execute(query).pl()
+    except duckdb.IOException:
+        return pl.DataFrame(schema={
+            "sgg_cd": pl.Utf8, "sgg_nm": pl.Utf8, "dong_cd": pl.Utf8, "dong_nm": pl.Utf8,
+            "apt_name": pl.Utf8, "mno": pl.Utf8, "sno": pl.Utf8, "deal_date": pl.Date,
+            "floor": pl.Int64, "price_ten_thousand": pl.Int64, "exclusive_area_m2": pl.Float64,
+        })
 
 
 # =====================================================================================
@@ -410,35 +437,52 @@ def main() -> None:
     lake_bucket = config["lake_bucket"]
 
     load_dim_apartment_broadcast(con, lake_bucket)
-    raw_df = fetch_joined_raw(con, lake_bucket, as_of_date, start_date)
-    print(f"[INFO] 브로드캐스트 조인 결과 행 수: {raw_df.height}건")
 
-    mart_df = shape_rtt_columns(raw_df)
-
-    # base_date(=거래일자)별로 나눠 파티션 단위 Upsert를 수행한다. 90일 조회 기간 안에서도
-    # 실제로 거래가 있는 날짜만 그룹이 생기므로, 이번 조회에 거래가 0건인 날짜는 아예 건드리지
-    # 않는다 - 기존 파티션이 있어도 삭제하지 않고 그대로 둔다(안전한 보수적 동작. 취소 처리된
-    # 거래는 이미 4번의 cancel_date 필터에서 걸러졌으므로 새 결과에 없는 게 정상일 수 있다).
-    day_groups = mart_df.partition_by("base_date", as_dict=True)
-
+    # [2026-08-30 SIGABRT 장애 대응] 90일치를 한 번에 Polars로 적재하지 않고, 하루(base_date)
+    # 단위로 조회 -> 파생컬럼 -> upsert까지 그 자리에서 끝내고 다음 날짜로 넘어간다. 이렇게
+    # 하면 한 시점에 메모리에 떠 있는 데이터가 하루치(평균 14만 행 수준)로 줄어, raw_day_df/
+    # mart_day_df가 동시에 살아 있어도 예전 90일 통짜 조회 1회분보다 훨씬 작다 - 매 반복마다
+    # 두 변수를 새로 대입하므로 이전 날짜의 데이터는 파이썬 GC 대상이 되어 다음 날짜로 넘어가기
+    # 전에 회수된다. 스키마/샘플 요약은 마지막으로 처리한 날짜의 결과를 대표값으로 출력한다
+    # (요약용 정보일 뿐 저장 로직과는 무관 - 스키마는 모든 날짜가 동일하다).
     status_counts = {"insert": 0, "update": 0, "skip": 0}
-    for (day_str,), day_df in sorted(day_groups.items()):
-        status = upsert_partition(con, lake_bucket, day_str, day_df.drop("base_date"))
+    total_row_count = 0
+    processed_day_count = 0
+    last_mart_day_df: pl.DataFrame | None = None
+
+    day = start_date
+    while day <= as_of_date:
+        day_str = day.strftime("%Y-%m-%d")
+        raw_day_df = fetch_joined_day(con, lake_bucket, day_str)
+
+        if raw_day_df.height == 0:
+            day += timedelta(days=1)
+            continue
+
+        mart_day_df = shape_rtt_columns(raw_day_df)
+        status = upsert_partition(con, lake_bucket, day_str, mart_day_df.drop("base_date"))
+
         status_counts[status] += 1
+        total_row_count += mart_day_df.height
+        processed_day_count += 1
+        last_mart_day_df = mart_day_df
+
+        day += timedelta(days=1)
 
     print(
-        f"\n[INFO] {MART_NAME} 파티션 Upsert 완료: 조회 기간 내 거래 존재 파티션 {len(day_groups)}개 처리 "
+        f"\n[INFO] {MART_NAME} 파티션 Upsert 완료: 조회 기간 내 거래 존재 파티션 {processed_day_count}개 처리 "
         f"(Insert {status_counts['insert']} / Update {status_counts['update']} / Skip {status_counts['skip']})"
     )
 
-    print(f"\n===== [SCHEMA] {MART_NAME} =====")
-    print(mart_df.schema)
+    if last_mart_day_df is not None:
+        print(f"\n===== [SCHEMA] {MART_NAME} =====")
+        print(last_mart_day_df.schema)
 
-    print(f"\n===== [SAMPLE] {MART_NAME} 상위 20건 =====")
-    with pl.Config(tbl_cols=-1, tbl_rows=20):
-        print(mart_df.head(20))
+        print(f"\n===== [SAMPLE] {MART_NAME} 마지막 처리 파티션({day_str}) 상위 20건 =====")
+        with pl.Config(tbl_cols=-1, tbl_rows=20):
+            print(last_mart_day_df.head(20))
 
-    print(f"\n===== [COUNT] {MART_NAME} 이번 실행 조회 총 레코드 수: {mart_df.height}건 =====")
+    print(f"\n===== [COUNT] {MART_NAME} 이번 실행 조회 총 레코드 수: {total_row_count}건 =====")
 
     con.close()
 

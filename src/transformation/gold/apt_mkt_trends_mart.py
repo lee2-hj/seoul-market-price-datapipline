@@ -62,10 +62,19 @@ PYEONG_M2 = 3.30578          # 1평 = 3.30578 m2 (전용면적 기준 평수 환
 
 # dim_apartment는 파티션이 없어 data/ 밑에 바로 parquet이 있고, fact_apt_transactions는
 # Iceberg 테이블 생성 시 PARTITIONED BY (days(deal_date))로 만들어져 있어(Real_Estate_Transform.py
-# 참고) data/deal_date_day=YYYY-MM-DD/*.parquet 형태로 중첩되어 있다 - 재귀 글롭(**)이 필요하다
-# (apt_rtt_mart.py의 DIM_APARTMENT_GLOB/FACT_APT_TRANSACTIONS_GLOB와 동일한 규칙).
+# 참고) data/deal_date_day=YYYY-MM-DD/*.parquet 형태로 중첩되어 있다.
 DIM_APARTMENT_GLOB = "dim_apartment/data/*.parquet"
-FACT_APT_TRANSACTIONS_GLOB = "fact_apt_transactions/data/**/*.parquet"
+
+# [2026-08-30 SIGABRT 장애 대응 - apt_rtt_mart.py와 동일 패턴] 90일 전체를 재귀 글롭(**)으로
+# 한 번에 조회하던 이전 방식은 raw_df/mart_df/partition_by() 복사본이 동시에 메모리에 떠 있어,
+# 데이터 규모가 커지면(apt_rtt_mart.py에서 1,296만 행 기준 실제 재현됨) Airflow가 이 프로세스에
+# 걸어둔 RLIMIT_AS(가상메모리 하드캡)를 Rust 기반 Polars 할당자가 들이받고
+# `memory allocation of N bytes failed` + SIGABRT로 죽는다. apt_rtt_mart.py를 먼저 하루 단위
+# 조회로 고치면서 이 스크립트도 fact_apt_transactions 규모/조인 패턴이 완전히 동일해 같은
+# 장애가 재현될 것으로 보고 선제적으로 동일하게 고친다 - main()이 90일을 순회하며 하루치씩
+# 이 글롭으로 그날 파티션 디렉터리 하나만 직접 지정해 조회한다(재귀 글롭 1회로 90개 디렉터리를
+# 매번 다시 나열하지 않아도 되는 부수 효과도 apt_rtt_mart.py와 동일).
+FACT_APT_TRANSACTIONS_DAY_GLOB = "fact_apt_transactions/data/deal_date_day={day}/*.parquet"
 
 # 최종 마트 이름/저장 경로: {S3_END_POINT}/{LAKE}/mart/apt_mkt_trends/base_date=YYYY-MM-DD/data.parquet
 # 파일명을 고정값(PARTITION_FILE_NAME)으로 둬서, 같은 base_date를 몇 번을 다시 써도(Update)
@@ -75,9 +84,9 @@ PARTITION_FILE_NAME = "data.parquet"
 
 # 아파트 특정 조인 키(Composite Join Key, 요구사항 4번) - 자치구코드/법정동코드/mno/sno
 # 조합으로 "특정 아파트(필지)"를 식별한다. dim_apartment에는 mno/sno가 없어 물리적 조인은
-# apt_name으로 수행하지만(아래 load_dim_apartment_broadcast/fetch_joined_raw 참고), 이 마트가
+# apt_name으로 수행하지만(아래 load_dim_apartment_broadcast/fetch_joined_day 참고), 이 마트가
 # 다루는 "아파트 단위"의 비즈니스 키는 이 4개 컬럼이다.
-# 컬럼명은 fetch_joined_raw()가 돌려주는 원본 이름(sgg_cd/dong_cd)이 아니라
+# 컬럼명은 fetch_joined_day()가 돌려주는 원본 이름(sgg_cd/dong_cd)이 아니라
 # shape_mkt_trends_columns()가 최종 마트 스키마로 리네이밍한 뒤의 이름(cgg_cd/stdg_cd)을
 # 쓴다 - _with_record_key()가 그 리네이밍 이후의 데이터프레임에 적용되기 때문이다.
 APT_IDENTITY_COLUMNS = ["cgg_cd", "stdg_cd", "mno", "sno"]
@@ -195,9 +204,10 @@ def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: st
 
 # =====================================================================================
 # 4. fact_apt_transactions 조회 - Predicate/Projection Pushdown + Broadcast Join
-#    - Predicate Pushdown: WHERE 절의 deal_date_day 조건이 fact_apt_transactions의 실제 물리
-#      파티션 디렉터리(data/deal_date_day=YYYY-MM-DD/)와 일치하므로, DuckDB가 파티션 값 자체로
-#      디렉터리 단위 스킵(파티션 프루닝)을 수행한다. 최근 90일 최적화의 핵심이다.
+#    - [2026-08-30 SIGABRT 장애 대응] 하루(day() 파티션 디렉터리 하나)만 조회한다 - main()이
+#      90일을 순회하며 하루치씩 호출한다(모듈 상단 FACT_APT_TRANSACTIONS_DAY_GLOB 주석 참고).
+#      디렉터리 자체를 하루 단위로 직접 지정하므로, 재귀 글롭(**)으로 90개 디렉터리를 매번
+#      다시 나열하지 않아도 된다.
 #    - Projection Pushdown: 서브쿼리에서 실제로 쓰는 컬럼만 SELECT해, 파케이 파일에서 그
 #      컬럼들만 읽어오게 한다(price_per_m2/deal_type/agent_sgg_nm 등은 애초에 읽지 않음).
 #    - mno IS NOT NULL 필터: mno/sno가 이 마트의 아파트 특정 조인 키(APT_IDENTITY_COLUMNS)의
@@ -209,13 +219,12 @@ def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: st
 #    - 90일 구간 전체를 한 번의 쿼리로 가져온다(파티션마다 재조회하지 않음) - 이후 5번에서
 #      Polars가 base_date(=deal_date)별로 인메모리 분할해 파티션 단위 Upsert에 넘긴다.
 # =====================================================================================
-def fetch_joined_raw(
+def fetch_joined_day(
     con: duckdb.DuckDBPyConnection,
     lake_bucket: str,
-    as_of_date,
-    start_date,
+    day_str: str,
 ) -> pl.DataFrame:
-    fact_s3_path = f"s3://{lake_bucket}/{FACT_APT_TRANSACTIONS_GLOB}"
+    fact_s3_path = f"s3://{lake_bucket}/{FACT_APT_TRANSACTIONS_DAY_GLOB.format(day=day_str)}"
     query = f"""
         SELECT
             d.sgg_cd  AS sgg_cd,
@@ -234,9 +243,7 @@ def fetch_joined_raw(
                 sgg_cd, dong_cd, apt_name, mno, sno,
                 deal_date, floor, price_ten_thousand, exclusive_area_m2
             FROM read_parquet('{fact_s3_path}', union_by_name=true)
-            WHERE deal_date_day >= DATE '{start_date}'
-              AND deal_date_day <= DATE '{as_of_date}'
-              AND (cancel_date IS NULL OR TRIM(cancel_date) = '')
+            WHERE (cancel_date IS NULL OR TRIM(cancel_date) = '')
               AND price_ten_thousand > 0
               AND exclusive_area_m2 > 0
               AND mno IS NOT NULL AND TRIM(mno) <> ''
@@ -246,8 +253,16 @@ def fetch_joined_raw(
            AND f.dong_cd = d.dong_cd
            AND f.apt_name = d.apt_name
     """
-    print(f"[INFO] fact_apt_transactions 조회(필터+브로드캐스트 조인): {fact_s3_path}")
-    return con.execute(query).pl()
+    try:
+        return con.execute(query).pl()
+    except duckdb.IOException:
+        # 해당 날짜에 거래가 아예 없어 파티션 디렉터리 자체가 없는 경우(S3 404 계열) - 빈
+        # 결과(0건)로 간주하고 넘어간다(read_existing_partition()과 동일한 예외 처리 패턴).
+        return pl.DataFrame(schema={
+            "sgg_cd": pl.Utf8, "sgg_nm": pl.Utf8, "dong_cd": pl.Utf8, "dong_nm": pl.Utf8,
+            "apt_name": pl.Utf8, "mno": pl.Utf8, "sno": pl.Utf8, "deal_date": pl.Date,
+            "floor": pl.Int64, "price_ten_thousand": pl.Int64, "exclusive_area_m2": pl.Float64,
+        })
 
 
 # =====================================================================================
@@ -439,36 +454,54 @@ def main() -> None:
     lake_bucket = config["lake_bucket"]
 
     load_dim_apartment_broadcast(con, lake_bucket)
-    raw_df = fetch_joined_raw(con, lake_bucket, as_of_date, start_date)
-    print(f"[INFO] 브로드캐스트 조인 결과 행 수: {raw_df.height}건")
 
-    mart_df = shape_mkt_trends_columns(raw_df)
-
-    # base_date(=계약일자)별로 나눠 파티션 단위 Upsert를 수행한다. 90일 조회 기간 안에서도
-    # 실제로 거래가 있는 날짜만 그룹이 생기므로, 이번 조회에 거래가 0건인 날짜는 아예 건드리지
-    # 않는다 - 기존 파티션이 있어도 삭제하지 않고 그대로 둔다(안전한 보수적 동작. 취소 처리된
-    # 거래는 이미 4번의 cancel_date 필터에서 걸러졌으므로 새 결과에 없는 게 정상일 수 있다).
-    day_groups = mart_df.partition_by("base_date", as_dict=True)
-
+    # [2026-08-30 SIGABRT 장애 대응 - apt_rtt_mart.py와 동일 패턴] 90일치를 한 번에 Polars로
+    # 적재하지 않고, 하루(base_date) 단위로 조회 -> 파생컬럼 -> upsert까지 그 자리에서 끝내고
+    # 다음 날짜로 넘어간다. 매 반복마다 두 변수를 새로 대입하므로 이전 날짜의 데이터는 파이썬
+    # GC 대상이 되어 다음 날짜로 넘어가기 전에 회수된다. 스키마/샘플 요약은 마지막으로 처리한
+    # 날짜의 결과를 대표값으로 출력한다(요약용 정보일 뿐 저장 로직과는 무관 - 스키마는 모든
+    # 날짜가 동일하다).
     status_counts = {"insert": 0, "update": 0, "skip": 0}
-    for (day_str,), day_df in sorted(day_groups.items()):
-        status = upsert_partition(con, lake_bucket, day_str, day_df.drop("base_date"))
+    total_row_count = 0
+    processed_day_count = 0
+    last_mart_day_df: pl.DataFrame | None = None
+
+    day = start_date
+    while day <= as_of_date:
+        day_str = day.strftime("%Y-%m-%d")
+        raw_day_df = fetch_joined_day(con, lake_bucket, day_str)
+
+        if raw_day_df.height == 0:
+            day += timedelta(days=1)
+            continue
+
+        mart_day_df = shape_mkt_trends_columns(raw_day_df)
+        status = upsert_partition(
+            con, lake_bucket, day_str, drop_technical_columns(mart_day_df)
+        )
+
         status_counts[status] += 1
+        total_row_count += mart_day_df.height
+        processed_day_count += 1
+        last_mart_day_df = mart_day_df
+
+        day += timedelta(days=1)
 
     print(
-        f"\n[INFO] {MART_NAME} 파티션 Upsert 완료: 조회 기간 내 거래 존재 파티션 {len(day_groups)}개 처리 "
+        f"\n[INFO] {MART_NAME} 파티션 Upsert 완료: 조회 기간 내 거래 존재 파티션 {processed_day_count}개 처리 "
         f"(Insert {status_counts['insert']} / Update {status_counts['update']} / Skip {status_counts['skip']})"
     )
 
-    final_schema_df = drop_technical_columns(mart_df)
-    print(f"\n===== [SCHEMA] {MART_NAME} =====")
-    print(final_schema_df.schema)
+    if last_mart_day_df is not None:
+        final_schema_df = drop_technical_columns(last_mart_day_df)
+        print(f"\n===== [SCHEMA] {MART_NAME} =====")
+        print(final_schema_df.schema)
 
-    print(f"\n===== [SAMPLE] {MART_NAME} 상위 20건 =====")
-    with pl.Config(tbl_cols=-1, tbl_rows=20):
-        print(final_schema_df.head(20))
+        print(f"\n===== [SAMPLE] {MART_NAME} 마지막 처리 파티션({day_str}) 상위 20건 =====")
+        with pl.Config(tbl_cols=-1, tbl_rows=20):
+            print(final_schema_df.head(20))
 
-    print(f"\n===== [COUNT] {MART_NAME} 이번 실행 조회 총 레코드 수: {mart_df.height}건 =====")
+    print(f"\n===== [COUNT] {MART_NAME} 이번 실행 조회 총 레코드 수: {total_row_count}건 =====")
 
     con.close()
 
