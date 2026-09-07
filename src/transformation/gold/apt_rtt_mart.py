@@ -194,7 +194,7 @@ def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: st
     print(f"[INFO] dim_apartment 브로드캐스트 테이블 구체화: {s3_path}")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE dim_apartment_bc AS
-        SELECT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name
+        SELECT DISTINCT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name
         FROM read_parquet('{s3_path}')
     """)
     # fetchone()은 정적으로 tuple | None으로 추론되어(COUNT(*)가 항상 한 행을 반환한다는 사실을
