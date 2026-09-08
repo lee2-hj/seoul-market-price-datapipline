@@ -37,6 +37,8 @@ from pyspark.sql.types import (
     StructType,
 )
 
+from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+
 LOOKBACK_DAYS = 90
 SUPPLY_AREA_RATIO = 1.3   # 전용면적 -> 공급면적 환산 비율
 PYEONG_M2 = 3.30578        # 1평 = 3.30578 m2
@@ -203,9 +205,15 @@ def load_dim_apartment(spark: SparkSession) -> DataFrame:
 
 
 # =====================================================================================
-# 4. Step 1: fact_apt_transactions 최근 90일 필터링 + 아파트 단위 1차 집계
-#    - deal_date 필터가 Iceberg의 days(deal_date) 파티션 프루닝을 그대로 활용하므로
-#      최근 90일 파티션만 읽는다.
+# 4. Step 1: fact_apt_transactions 최근 90일 필터링(+ 적응형 조회기간 폴백) + 아파트 단위
+#    1차 집계
+#    - load_fact_with_adaptive_lookback()이 deal_date 필터로 Iceberg의 days(deal_date)
+#      파티션 프루닝을 그대로 활용해 최근 90일 파티션만 읽는다(빠른 경로). dim_apartment에는
+#      있지만 이 90일 구간에 거래가 없는 단지("장기 미거래 단지")는, 그 단지에 한해서만 전체
+#      이력에서 자신의 최신 거래일자를 찾아 그 날짜 기준 최근 90일을 추가로 보강한다
+#      (adaptive_lookback.py 참고) - dim_apartment에 단지명은 있는데 프론트에서 조회할
+#      데이터가 없는 문제를 막기 위함이다. 거래취소건 제외 + 금액/면적 0 이하 제거는 이
+#      안에서 이미 적용된다.
 #    - 아파트 식별 키(sgg_cd+dong_cd+apt_name) 기준으로 매매가 총합/평단가 총합/
 #      최근 매매가(max_by)/거래량을 여기서 한 번에 집계해, 이후 단계는 소용량
 #      집계 결과만 다루게 만든다(셔플 최소화).
@@ -216,15 +224,18 @@ def load_dim_apartment(spark: SparkSession) -> DataFrame:
 #    - mno/sno(지번)는 API 조회 파라미터로 쓸 값이라, 아파트당 대표값 1개만
 #      (first-non-null) 함께 뽑아둔다.
 # =====================================================================================
-def aggregate_recent_trades(spark: SparkSession, base_date: date, start_date: date) -> DataFrame:
+def aggregate_recent_trades(
+    spark: SparkSession, dim_df: DataFrame, base_date: date, start_date: date
+) -> DataFrame:
     fact_df = (
-        spark.table("lakehouse.fact_apt_transactions")
-        .filter(
-            (F.col("deal_date") >= F.lit(start_date))
-            & (F.col("deal_date") <= F.lit(base_date))
-            & (F.col("cancel_date").isNull() | (F.trim(F.col("cancel_date")) == ""))
-            & (F.col("price_ten_thousand") > 0)
-            & (F.col("exclusive_area_m2") > 0)
+        load_fact_with_adaptive_lookback(
+            spark,
+            dim_apartment_df=dim_df,
+            fact_table="lakehouse.fact_apt_transactions",
+            base_date=base_date,
+            start_date=start_date,
+            lookback_days=LOOKBACK_DAYS,
+            extra_select_cols=("mno", "sno"),
         )
         .withColumn(
             "supply_pyeong",
@@ -522,7 +533,7 @@ def main():
     spark = create_spark_session(config)
 
     dim_df = load_dim_apartment(spark)
-    agg_df = aggregate_recent_trades(spark, base_date, start_date).cache()
+    agg_df = aggregate_recent_trades(spark, dim_df, base_date, start_date).cache()
 
     apartment_rows = collect_apartment_keys(agg_df)
     print(f"[INFO] 최근 {LOOKBACK_DAYS}일 거래가 있는 고유 아파트 수: {len(apartment_rows)}건")

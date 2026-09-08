@@ -54,6 +54,8 @@ import duckdb
 import polars as pl
 from dotenv import load_dotenv
 
+from transformation.gold.adaptive_lookback_duckdb import run_adaptive_backward_fallback
+
 # =====================================================================================
 # 1. 상수
 # =====================================================================================
@@ -223,8 +225,18 @@ def fetch_joined_day(
     con: duckdb.DuckDBPyConnection,
     lake_bucket: str,
     day_str: str,
+    filter_table: str | None = None,
 ) -> pl.DataFrame:
+    """filter_table: 지정하면 dim_apartment_bc 조인 결과를 그 TEMP TABLE(sgg_cd/dong_cd/
+    apt_name)과 추가로 세미조인해 좁힌다 - adaptive_lookback_duckdb.py의 적응형 조회기간
+    폴백이 "이번 날짜에 아직 관심 있는 소수 단지"만 조회할 때 사용한다(기본 호출은 None이라
+    기존 동작과 완전히 동일하다)."""
     fact_s3_path = f"s3://{lake_bucket}/{FACT_APT_TRANSACTIONS_DAY_GLOB.format(day=day_str)}"
+    extra_join = (
+        f"INNER JOIN {filter_table} AS m "
+        "ON f.sgg_cd = m.sgg_cd AND f.dong_cd = m.dong_cd AND f.apt_name = m.apt_name"
+        if filter_table else ""
+    )
     query = f"""
         SELECT
             d.sgg_cd  AS sgg_cd,
@@ -252,6 +264,7 @@ def fetch_joined_day(
             ON f.sgg_cd = d.sgg_cd
            AND f.dong_cd = d.dong_cd
            AND f.apt_name = d.apt_name
+        {extra_join}
     """
     try:
         return con.execute(query).pl()
@@ -465,6 +478,9 @@ def main() -> None:
     total_row_count = 0
     processed_day_count = 0
     last_mart_day_df: pl.DataFrame | None = None
+    # 기본 90일 구간에서 실제로 거래가 확인된 단지 키 집합 - 적응형 조회기간 폴백(아래)이
+    # "dim_apartment에는 있지만 이 90일 안에는 거래가 없는 단지"를 판별하는 데 쓴다.
+    seen_apt_keys: set = set()
 
     day = start_date
     while day <= as_of_date:
@@ -474,6 +490,10 @@ def main() -> None:
         if raw_day_df.height == 0:
             day += timedelta(days=1)
             continue
+
+        seen_apt_keys.update(
+            zip(raw_day_df["sgg_cd"].to_list(), raw_day_df["dong_cd"].to_list(), raw_day_df["apt_name"].to_list())
+        )
 
         mart_day_df = shape_mkt_trends_columns(raw_day_df)
         status = upsert_partition(
@@ -491,6 +511,29 @@ def main() -> None:
         f"\n[INFO] {MART_NAME} 파티션 Upsert 완료: 조회 기간 내 거래 존재 파티션 {processed_day_count}개 처리 "
         f"(Insert {status_counts['insert']} / Update {status_counts['update']} / Skip {status_counts['skip']})"
     )
+
+    # -----------------------------------------------------------------------------
+    # 적응형 조회기간 폴백: dim_apartment에는 있지만 위 기본 90일 구간에는 거래가 전혀
+    # 없던 단지에 한해, 과거로 거슬러 올라가며 자신의 최신 거래일자 기준 최근 90일을
+    # 추가로 채운다(adaptive_lookback_duckdb.py 모듈 docstring 참고). 대다수 실행에서는
+    # 이런 단지가 없어 즉시 반환되며 추가 비용이 없다.
+    # -----------------------------------------------------------------------------
+    fallback_result = run_adaptive_backward_fallback(
+        con,
+        lake_bucket,
+        start_date=start_date,
+        lookback_days=LOOKBACK_DAYS,
+        seen_apt_keys=seen_apt_keys,
+        mart_name=MART_NAME,
+        fetch_day_fn=fetch_joined_day,
+        shape_fn=shape_mkt_trends_columns,
+        upsert_fn=lambda c, lb, d, df: upsert_partition(c, lb, d, drop_technical_columns(df)),
+    )
+    status_counts = {
+        key: status_counts[key] + fallback_result["status_counts"][key] for key in status_counts
+    }
+    total_row_count += fallback_result["total_row_count"]
+    processed_day_count += fallback_result["processed_day_count"]
 
     if last_mart_day_df is not None:
         final_schema_df = drop_technical_columns(last_mart_day_df)

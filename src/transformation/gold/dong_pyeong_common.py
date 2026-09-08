@@ -32,6 +32,8 @@ from pyspark.sql.window import Window
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+
 LOOKBACK_DAYS = 90
 SUPPLY_AREA_RATIO = 1.3  # 전용면적 -> 공급면적 환산 비율
 PYEONG_M2 = 3.30578       # 1평 = 3.30578 m2
@@ -505,25 +507,21 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     dim_apartment_df = spark.table("lakehouse.dim_apartment").select(
         "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name"
     )
-    fact_df = (
-        spark.table("lakehouse.fact_apt_transactions")
-        .filter(
-            (F.col("deal_date") >= F.lit(start_date)) & (F.col("deal_date") <= F.lit(base_date))
-        )
-        .select(
-            "sgg_cd", "dong_cd", "apt_name",
-            "price_ten_thousand", "exclusive_area_m2", "floor", "cancel_date", "deal_date",
-        )
-    )
-
-    # --- 1차 정제 ---
-    # 거래취소건 제외 + 금액/면적 0 이하 제거(데이터 오염이 평균/평당가 계산을 왜곡하지
-    # 않도록). BLDG_USG(건물용도) == '아파트' 필터는 fact_apt_transactions가 이미 Silver
-    # 레이어에서 걸러진 뒤 적재된 테이블이라 이 테이블에는 그 컬럼 자체가 없다.
-    fact_df = fact_df.filter(
-        (F.col("cancel_date").isNull() | (F.trim(F.col("cancel_date")) == ""))
-        & (F.col("price_ten_thousand") > 0)
-        & (F.col("exclusive_area_m2") > 0)
+    # 적응형 조회기간 폴백(adaptive_lookback.py): 기본 90일 구간(빠른 경로, 파티션 프루닝)을
+    # 우선 읽고, dim_apartment에는 있지만 그 구간에 거래가 없는 단지에 한해 전체 이력에서
+    # 자신의 최신 거래일자 기준 최근 90일을 추가로 보강한다 - dim_apartment에 단지명은 있는데
+    # 프론트에서 조회할 데이터가 없는 문제를 막기 위함이다. 거래취소건 제외 + 금액/면적 0
+    # 이하 제거(데이터 품질 필터)도 이 안에서 함께 적용된다. BLDG_USG(건물용도) == '아파트'
+    # 필터는 fact_apt_transactions가 이미 Silver 레이어에서 걸러진 뒤 적재된 테이블이라 이
+    # 테이블에는 그 컬럼 자체가 없다.
+    fact_df = load_fact_with_adaptive_lookback(
+        spark,
+        dim_apartment_df=dim_apartment_df,
+        fact_table="lakehouse.fact_apt_transactions",
+        base_date=base_date,
+        start_date=start_date,
+        lookback_days=LOOKBACK_DAYS,
+        extra_select_cols=("floor",),
     )
 
     # --- dim_apartment 브로드캐스트 조인 (소용량 마스터 테이블을 브로드캐스트해서
@@ -554,6 +552,12 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
                # 캐싱하지 않으면 원천 읽기+조인이 두 번 실행된다.
 
     # --- 카카오맵 API 지오코딩 (위/경도 + 정확도 부여) ---
+    # [주의] jibun_lookup은 여전히 기본 [start_date, base_date] 90일 구간의 Bronze 월
+    # 파티션만 조회한다 - 적응형 조회기간 폴백(load_fact_with_adaptive_lookback)으로
+    # 보강된 "장기 미거래 단지"의 실제 거래일자는 이 구간보다 훨씬 과거일 수 있어 지번
+    # 매칭이 안 될 수 있다. 이 경우 지오코딩은 1~2단계(지번 기반) 대신 3~4단계(단지명/법정동
+    # 기반) 폴백으로 자연스럽게 넘어가므로 배치가 깨지지는 않고, 좌표 정확도만 다소 낮아질
+    # 수 있다(전체 이력을 매번 다시 스캔하는 비용을 피하기 위한 의도적 트레이드오프).
     jibun_lookup = _build_jibun_lookup(spark, raw_bucket, start_date, base_date)
 
     distinct_apt_rows = (

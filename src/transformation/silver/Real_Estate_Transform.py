@@ -262,8 +262,20 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
             F.col("OPBIZ_RESTAGNT_SGG_NM").cast("string").alias("agent_sgg_nm"),
             # 지번(본번/부번). 기존 컬럼/로직은 그대로 두고 끝에 추가만 한다 - MNO/SNO는
             # Bronze 원본에는 있었지만 지금까지 Silver에는 반영되지 않았던 필드다.
-            F.col("MNO").cast("string").alias("mno"),
-            F.col("SNO").cast("string").alias("sno"),
+            # [NULL/빈 문자열 정규화] Bronze 원본은 지번이 없는 거래를 "실제 NULL"과 "빈
+            # 문자열('')" 양쪽으로 뒤섞어 내려보낸다. 아래 5-4 중복 제거는 Window
+            # partitionBy(...) 로 mno/sno "원본값 그대로" 같은지를 비교하는데(NULL과 ''은
+            # 서로 다른 값으로 취급되어 별도 그룹이 됨), 반면 5-6의 fact_apt_transactions
+            # MERGE INTO는 ON 절에서 coalesce(mno, '') = coalesce(mno, '')로 NULL-safe하게
+            # 비교한다(NULL과 ''을 같은 값으로 취급). 이 두 비교 기준이 서로 다르면, 지번이
+            # 없어 mno가 어떤 행은 NULL로 어떤 행은 ''으로 들어온 "서로 다른 두 세대"의 거래가
+            # 5-4에서는 별개로 남았다가 5-6의 MERGE에서는 같은 자연키로 오판되어 "타겟 1행에
+            # 소스 2행이 매칭"되는 MERGE_CARDINALITY_VIOLATION으로 배치가 죽는다(GCP 운영
+            # 환경에서 실제로 재현됨). 여기서 공백/빈 문자열을 NULL로 미리 정규화해 두 비교
+            # 기준을 일치시킨다 - 이후 모든 단계(5-4 dedup, dim/geocoding의 mno/sno 처리,
+            # 5-6 MERGE)가 항상 같은 "지번 없음" 표현(NULL)만 보게 된다.
+            F.nullif(F.trim(F.col("MNO").cast("string")), F.lit("")).alias("mno"),
+            F.nullif(F.trim(F.col("SNO").cast("string")), F.lit("")).alias("sno"),
         )
         # 5-2. 계약일자가 유효하지 않은(null) 레코드는 제외
         .filter(F.col("deal_date").isNotNull())
@@ -319,14 +331,27 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
     dim_source_df.createOrReplaceTempView("dim_apartment_source")
 
     # Iceberg MERGE INTO: 키가 일치하면 UPDATE, 없으면 INSERT (삭제 후 재적재 방식 지양)
+    # [스키마 드리프트 방어] "UPDATE SET *"/"INSERT *"는 Spark가 대상 테이블의 실제 컬럼
+    # 목록을 기준으로 값을 자동 전개하는데, GCP 운영 환경의 lakehouse.dim_apartment
+    # Iceberg 테이블이 (과거 실험/수동 작업 등으로) 이 스크립트의 CREATE TABLE DDL에는 없는
+    # 여분의 컬럼(예: mno/sno)을 이미 물리적으로 갖고 있으면, source(dim_apartment_source,
+    # 6개 컬럼만 보유)에는 그 이름의 컬럼이 없어 "UNRESOLVED_COLUMN" 분석 오류로 배치 전체가
+    # 실패한다(실제로 GCP 운영 환경에서 `mno`를 찾을 수 없다는 오류로 재현됨). source/target의
+    # 컬럼 구성이 100% 일치한다는 가정에 기대는 "*" 대신, 이 스크립트가 실제로 관리하는 6개
+    # 컬럼만 명시적으로 지정한다 - target에 그 외 여분의 컬럼이 있어도 이 MERGE는 그 컬럼을
+    # 건드리지 않고(NULL 유지) 항상 안전하게 동작한다.
     spark.sql("""
         MERGE INTO lakehouse.dim_apartment AS target
         USING dim_apartment_source AS source
         ON  target.sgg_cd = source.sgg_cd
         AND target.dong_cd = source.dong_cd
         AND target.apt_name = source.apt_name
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        WHEN MATCHED THEN UPDATE SET
+            target.sgg_nm = source.sgg_nm,
+            target.dong_nm = source.dong_nm,
+            target.build_year = source.build_year
+        WHEN NOT MATCHED THEN INSERT (sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name, build_year)
+            VALUES (source.sgg_cd, source.sgg_nm, source.dong_cd, source.dong_nm, source.apt_name, source.build_year)
     """)
 
     print(f"[INFO] [{label}] dim_apartment MERGE INTO(Upsert) 완료")
@@ -337,7 +362,17 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
     #      (다중 날짜 모드에서 이전 날짜가 새로 추가한 단지를 이번 날짜의 조인에서도
     #      곧바로 찾을 수 있어야 하기 때문 - 함수 진입 시점에 한 번만 읽어두면 안 된다).
     # -----------------------------------------------------------------------------
-    dim_apartment_df = spark.table("lakehouse.dim_apartment")
+    # [MERGE_CARDINALITY_VIOLATION 방어 1] dim_apartment는 (sgg_cd, dong_cd, apt_name)
+    # 키로 MERGE Upsert되므로 정상적으로는 키당 1행만 있어야 하지만, 이 MERGE 기반 Upsert가
+    # 도입되기 전의 운영 데이터(과거 BULK 적재 등)에 이미 같은 키의 중복 행이 남아 있을 수도
+    # 있다. 그런 중복이 있으면 아래 브로드캐스트 조인이 그 키 수만큼 fan-out(같은 거래가
+    # 여러 행으로 뻥튀기)되어, 결과적으로 fact_df에 "완전히 같은 자연키를 가진 중복 행"이
+    # 여러 개 생기고 5-6 MERGE INTO에서 MERGE_CARDINALITY_VIOLATION으로 이어진다. 조인 전에
+    # 키 기준으로 한 번 더 dropDuplicates해 이 가능성을 원천 차단한다(정상 상황에서는 이미
+    # 유일하므로 완전히 무해한 안전망일 뿐이다).
+    dim_apartment_df = spark.table("lakehouse.dim_apartment").dropDuplicates(
+        ["sgg_cd", "dong_cd", "apt_name"]
+    )
 
     fact_df = (
         silver_df.alias("f")
@@ -365,6 +400,24 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
             "f.mno",
             "f.sno",
         )
+        # [MERGE_CARDINALITY_VIOLATION 방어 2] 위 조인이 (이론상 불가능해야 하지만) 그래도
+        # 자연키(자치구+법정동+단지명+지번+계약일+층+전용면적)당 2행 이상을 만들어냈다면,
+        # 5-6 MERGE INTO의 ON 절과 똑같은 NULL-safe 키로 마지막에 한 번 더 중복을 제거한다
+        # (mno/sno는 위에서 이미 NULL로 정규화됐으므로 raw 비교만으로 5-4와 동일한 결과가
+        # 보장된다). 이 조인은 sgg_cd/dong_cd/apt_name 외에는 아무 값도 바꾸지 않으므로,
+        # 자연키가 겹치는 행은 100% 동일한 내용일 것으로 기대되지만, 혹시라도 남는 동률은
+        # 5-4와 동일하게 거래가가 더 높은 쪽을 대표로 남긴다.
+        .withColumn(
+            "_dedup_rn",
+            F.row_number().over(
+                Window.partitionBy(
+                    "sgg_cd", "dong_cd", "apt_name", "mno", "sno",
+                    "deal_date", "floor", "exclusive_area_m2",
+                ).orderBy(F.desc("price_ten_thousand"))
+            ),
+        )
+        .filter(F.col("_dedup_rn") == 1)
+        .drop("_dedup_rn")
     )
 
     # [중복 적재 방지] 예전에는 이 자리에서 fact_df를 조건 없이 append했다. 이 계약일이
@@ -400,6 +453,12 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
         _deal_date_literal = f"{label[:4]}-{label[4:6]}-{label[6:8]}"
         _target_date_filter = f"AND target.deal_date = DATE'{_deal_date_literal}'\n        "
 
+    # [스키마 드리프트 방어] dim_apartment MERGE와 동일한 이유로 "UPDATE SET *"/"INSERT *"
+    # 대신 이 스크립트가 실제로 관리하는 컬럼을 명시적으로 나열한다 - fact_apt_transactions는
+    # 이미 위 4번에서 mno/sno 컬럼 존재를 스스로 보장하므로 현재는 안전하지만, 앞으로 물리
+    # 테이블에 이 스크립트가 모르는 컬럼이 추가되더라도(운영 환경 스키마 드리프트) 이 MERGE가
+    # source에 없는 컬럼을 억지로 참조하다 실패하는 일이 없도록 dim_apartment와 동일한
+    # 방어 스타일로 통일한다.
     fact_df.createOrReplaceTempView("fact_apt_transactions_source")
     spark.sql(f"""
         MERGE INTO lakehouse.fact_apt_transactions AS target
@@ -412,8 +471,21 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
         AND target.deal_date = source.deal_date
         AND target.floor = source.floor
         AND target.exclusive_area_m2 = source.exclusive_area_m2
-        {_target_date_filter}WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        {_target_date_filter}WHEN MATCHED THEN UPDATE SET
+            target.price_ten_thousand = source.price_ten_thousand,
+            target.price_per_m2 = source.price_per_m2,
+            target.deal_type = source.deal_type,
+            target.cancel_date = source.cancel_date,
+            target.agent_sgg_nm = source.agent_sgg_nm
+        WHEN NOT MATCHED THEN INSERT (
+            deal_date, sgg_cd, dong_cd, apt_name, price_ten_thousand, exclusive_area_m2,
+            price_per_m2, floor, deal_type, cancel_date, agent_sgg_nm, mno, sno
+        ) VALUES (
+            source.deal_date, source.sgg_cd, source.dong_cd, source.apt_name,
+            source.price_ten_thousand, source.exclusive_area_m2, source.price_per_m2,
+            source.floor, source.deal_type, source.cancel_date, source.agent_sgg_nm,
+            source.mno, source.sno
+        )
     """)
 
     print(f"[INFO] [{label}] fact_apt_transactions MERGE INTO(Upsert) 완료")

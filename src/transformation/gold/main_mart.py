@@ -37,6 +37,8 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.window import Window
 
+from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+
 
 # =====================================================================================
 # 1. 집계 기준일(BASE_DATE) 및 조회 기간 결정
@@ -144,44 +146,34 @@ spark.sparkContext.setLogLevel("WARN")
 
 
 # =====================================================================================
-# 4. Silver 레이어 읽기 (원천 로딩 최적화)
+# 4. Silver 레이어 읽기 (원천 로딩 최적화) + 5. 1차 정제(데이터 품질 필터) + 적응형 조회기간
+#    폴백 (dim_apartment에는 있지만 기본 90일 구간에는 거래가 없는 단지 보강)
 #    - dim_apartment: 소용량 마스터 테이블이라 브로드캐스트 조인 대상으로 쓸 컬럼만 선별한다.
-#    - fact_apt_transactions: 조인 전에 deal_date로 먼저 필터링하고 필요한 컬럼만 프로젝션한다.
-#      이 테이블은 PARTITIONED BY (days(deal_date))로 만들어져 있어서(Real_Estate_Transform.py
-#      참고), deal_date 조건이 Iceberg의 파티션 프루닝에 그대로 활용되어 최근 90일 day
-#      파티션만 실제로 읽힌다. mno/sno는 Silver 스키마 진화(ADD COLUMNS)로 이미
-#      fact_apt_transactions에 들어 있으므로, Bronze 원본을 별도로 다시 스캔할 필요가 없다
-#      (build_dong_pyeong_mart.py처럼 지번 보조조회용 Bronze month 파티션을 추가로 읽지 않음
-#      -> 불필요한 Full Scan을 피하는 최적화).
+#    - fact_apt_transactions: load_fact_with_adaptive_lookback()이 우선 deal_date로
+#      필터링하고 필요한 컬럼만 프로젝션한다(빠른 경로). 이 테이블은 PARTITIONED BY
+#      (days(deal_date))로 만들어져 있어서(Real_Estate_Transform.py 참고), deal_date 조건이
+#      Iceberg의 파티션 프루닝에 그대로 활용되어 최근 90일 day 파티션만 실제로 읽힌다.
+#      dim_apartment에는 등록돼 있지만 이 90일 구간에 거래가 하나도 없는 단지("장기 미거래
+#      단지")는, 그 단지에 한해서만 전체 이력에서 자신의 최신 거래일자를 찾아 그 날짜 기준
+#      최근 90일을 추가로 보강한다(adaptive_lookback.py 모듈 docstring 참고) - 그래야
+#      dim_apartment에 단지명은 있는데 프론트에서 조회할 데이터가 없는 문제가 발생하지 않는다.
+#      mno/sno는 Silver 스키마 진화(ADD COLUMNS)로 이미 fact_apt_transactions에 들어 있으므로,
+#      Bronze 원본을 별도로 다시 스캔할 필요가 없다.
+#    - 거래취소건 제외 + 금액/면적 0 이하 제거(데이터 오염 방지)는
+#      load_fact_with_adaptive_lookback() 내부에서 이미 적용되어 반환된다.
 # =====================================================================================
 dim_apartment_df = spark.table("lakehouse.dim_apartment").select(
     "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name"
 )
 
-fact_df = (
-    spark.table("lakehouse.fact_apt_transactions")
-    .filter(
-        (F.col("deal_date") >= F.lit(start_date)) & (F.col("deal_date") <= F.lit(base_date))
-    )
-    .select(
-        "sgg_cd", "dong_cd", "apt_name",
-        "price_ten_thousand", "exclusive_area_m2", "deal_date",
-        "cancel_date", "mno", "sno",
-    )
-)
-
-
-# =====================================================================================
-# 5. 1차 정제
-#    - 거래취소건 제외: Silver 레이어(Real_Estate_Transform.py)가 이미 cancel_date로
-#      이름을 바꿔 저장해뒀으므로 여기서는 cancel_date를 기준으로 거른다.
-#    - 금액/면적 0 이하 제거: 데이터 오염(0원/0㎡ 등 비정상 레코드)이 합계 계산을
-#      왜곡하지 않도록 걸러낸다.
-# =====================================================================================
-fact_df = fact_df.filter(
-    (F.col("cancel_date").isNull() | (F.trim(F.col("cancel_date")) == ""))
-    & (F.col("price_ten_thousand") > 0)
-    & (F.col("exclusive_area_m2") > 0)
+fact_df = load_fact_with_adaptive_lookback(
+    spark,
+    dim_apartment_df=dim_apartment_df,
+    fact_table="lakehouse.fact_apt_transactions",
+    base_date=base_date,
+    start_date=start_date,
+    lookback_days=LOOKBACK_DAYS,
+    extra_select_cols=("mno", "sno"),
 )
 
 
