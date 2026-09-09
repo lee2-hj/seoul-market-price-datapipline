@@ -33,6 +33,16 @@ MAX_PAGE_ATTEMPTS = 3
 # 서버 쪽에서 DoS 공격으로 오인해 나중에 차단될 수 있어서 둔 안전장치다.
 REQUEST_INTERVAL_SECONDS = 0.5
 
+# [2026-09-09 API 호출 수 절감] fetch_real_estate_recent가 매일 lookback_days(기본 90일)
+# 전체를 하루 단위로 다시 호출하면, 공공데이터포털류 API의 일일 호출 건수 제한을 매일
+# 똑같이 소모하게 된다. 최근 RECENT_DAILY_CHECK_DAYS일은 신고 지연/정정이 가장 잦은
+# 구간이라 매일 그대로 재확인하고, 그보다 오래된 날짜는 완전히 스킵하는 대신
+# STALE_RECHECK_INTERVAL_DAYS일에 한 번씩만 주기적으로 재확인한다(offset 기준 모듈로 -
+# 별도 상태 저장 없이도 각 오래된 날짜가 결국 주기적으로 다시 확인되게 하는 가장 단순한
+# 방식). "완전히 스킵"이 아니라 "빈도만 낮추는" 방식이라 뒤늦은 정정도 결국 반영된다.
+RECENT_DAILY_CHECK_DAYS = int(os.getenv("REAL_ESTATE_RECENT_DAILY_CHECK_DAYS", "14"))
+STALE_RECHECK_INTERVAL_DAYS = int(os.getenv("REAL_ESTATE_STALE_RECHECK_INTERVAL_DAYS", "7"))
+
 # ---------------------------------------------------------------------------
 # 서울 열린데이터광장 API는 선택 필터를 쿼리스트링이 아니라 경로 세그먼트 "위치"로 받는다.
 # 즉 뒤쪽 필터(BLDG_USG 등)를 쓰려면 그 앞 순서의 필터 자리까지 전부 채워야 한다 - 이때
@@ -392,11 +402,26 @@ def fetch_real_estate_recent(
 
     all_changed: list[str] = []
     all_checked: list[str] = []
+    skipped_count = 0
     for offset in range(lookback_days):
+        # 최근 RECENT_DAILY_CHECK_DAYS일은 매일 재확인하고, 그보다 오래된 날짜는
+        # STALE_RECHECK_INTERVAL_DAYS일에 한 번만 API를 호출한다(위 상수 설명 참고) - 공공
+        # API 일일 호출 수를 아끼기 위함이며, 완전히 건너뛰는 게 아니라 주기를 늘리는
+        # 것뿐이라 뒤늦은 정정도 결국 반영된다.
+        if offset >= RECENT_DAILY_CHECK_DAYS and offset % STALE_RECHECK_INTERVAL_DAYS != 0:
+            skipped_count += 1
+            continue
         ctrt_day = (base_date - timedelta(days=offset)).strftime("%Y%m%d")
         result = fetch_real_estate(con, service_key, ctrt_day_from=ctrt_day, ctrt_day_to=ctrt_day)
         all_checked.extend(result["checked_ctrt_days"])
         all_changed.extend(result["changed_ctrt_days"])
+
+    if skipped_count:
+        logger.info(
+            "%s: 오래된 계약일(최근 %d일 이후) 중 %d일은 이번 실행에서 호출 생략 "
+            "(%d일마다 한 번만 재확인).",
+            OPERATION_NAME, RECENT_DAILY_CHECK_DAYS, skipped_count, STALE_RECHECK_INTERVAL_DAYS,
+        )
 
     logger.info(
         "%s: %s 기준 최근 %d일(계약일 %d건 확인) 중 %d건 변경: %s",

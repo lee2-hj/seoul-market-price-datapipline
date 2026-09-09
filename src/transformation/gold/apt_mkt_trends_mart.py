@@ -517,7 +517,28 @@ def main() -> None:
     # 없던 단지에 한해, 과거로 거슬러 올라가며 자신의 최신 거래일자 기준 최근 90일을
     # 추가로 채운다(adaptive_lookback_duckdb.py 모듈 docstring 참고). 대다수 실행에서는
     # 이런 단지가 없어 즉시 반환되며 추가 비용이 없다.
+    #
+    # [2026-09-09 FastAPI count:0 대응] run_adaptive_backward_fallback()이 찾아낸 데이터를
+    # 예전처럼 각 단지의 과거 deal_date 파티션(base_date=day_str)에 바로 upsert하면, FastAPI는
+    # MAX(base_date)(=as_of_date) 최신 파티션만 조회하므로 장기 미거래 단지가 그 파티션에는
+    # 전혀 반영되지 않아 count:0으로 보인다. 그래서 upsert_fn 자리에 실제 저장 대신 수집만
+    # 하는 collect_fallback_upsert를 넘기고, 폴백이 끝난 뒤 모인 데이터를 한꺼번에
+    # as_of_date_str(최신 파티션) 하나로 upsert한다 - upsert_partition()이 그 파티션에 이미
+    # 있는 당일 거래 데이터와 자동으로 record_key 기준 병합해주므로 별도 처리가 필요 없다.
     # -----------------------------------------------------------------------------
+    fallback_rows: list[pl.DataFrame] = []
+
+    def collect_fallback_upsert(
+        c: duckdb.DuckDBPyConnection, lb: str, d: str, df: pl.DataFrame
+    ) -> str:
+        """실제 파티션 저장 대신, 폴백으로 수집된 하루치 데이터를 fallback_rows에만 모은다
+        (과거 deal_date 파티션에는 쓰지 않음). 반환값 "skip"은 status_counts 카운트 자리를
+        채우기 위한 임시값일 뿐 실제 처리 결과와 무관하다 - 실제 Insert/Update 여부는 아래
+        최종 as_of_date_str 파티션 upsert 시점에 결정되며, 그 결과는 fallback_rows 건수
+        기반으로 별도 로그에 남긴다."""
+        fallback_rows.append(drop_technical_columns(df))
+        return "skip"
+
     fallback_result = run_adaptive_backward_fallback(
         con,
         lake_bucket,
@@ -527,13 +548,27 @@ def main() -> None:
         mart_name=MART_NAME,
         fetch_day_fn=fetch_joined_day,
         shape_fn=shape_mkt_trends_columns,
-        upsert_fn=lambda c, lb, d, df: upsert_partition(c, lb, d, drop_technical_columns(df)),
+        upsert_fn=collect_fallback_upsert,
     )
     status_counts = {
         key: status_counts[key] + fallback_result["status_counts"][key] for key in status_counts
     }
     total_row_count += fallback_result["total_row_count"]
     processed_day_count += fallback_result["processed_day_count"]
+
+    # 폴백으로 모인 데이터(있다면)를 최신 파티션(as_of_date_str) 하나로 합쳐 upsert한다.
+    # upsert_partition()은 그 파티션에 이미 당일 거래 데이터가 있어도 record_key 기준으로
+    # 자동 병합하므로 기존 데이터를 덮어쓰지 않는다.
+    as_of_date_str = as_of_date.strftime("%Y-%m-%d")
+    if fallback_rows:
+        combined_fallback_df = pl.concat(fallback_rows, how="vertical")
+        fallback_status = upsert_partition(con, lake_bucket, as_of_date_str, combined_fallback_df)
+        print(
+            f"\n[INFO] {MART_NAME}: 장기 미거래 단지 폴백 데이터 {combined_fallback_df.height}건을 "
+            f"최신 파티션(base_date={as_of_date_str})에 병합 upsert 완료 ({fallback_status})"
+        )
+    else:
+        print(f"\n[INFO] {MART_NAME}: 폴백 대상 없음 - 최신 파티션({as_of_date_str}) 병합 생략")
 
     if last_mart_day_df is not None:
         final_schema_df = drop_technical_columns(last_mart_day_df)

@@ -30,7 +30,7 @@ dim_apartment 단지"만 추려서 시작일 하루 전(start_date - 1일)부터
 """
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import duckdb
 import polars as pl
@@ -41,6 +41,80 @@ import polars as pl
 MAX_EXTRA_LOOKBACK_DAYS = int(os.getenv("ADAPTIVE_LOOKBACK_MAX_EXTRA_DAYS", "1095"))
 
 INTERESTED_APTS_TABLE = "_adaptive_interested_apts"
+
+# [2026-09-09 재실행 비용 절감] 장기 미거래 단지의 "최신 거래일자를 못 찾음(searching)"
+# 탐색 결과를 다음 실행에서도 재사용하기 위한 캐시 저장 위치. 이 캐시가 없으면 Airflow를
+# 다시 돌릴 때마다 이미 지난 실행에서 찾아둔 단지까지 매번 최대 MAX_EXTRA_LOOKBACK_DAYS일을
+# 처음부터 다시 거슬러 올라가며 재탐색하게 된다(단지별로 한 번만 비싼 탐색을 하고, 이후에는
+# 캐시된 날짜 기준 lookback_days 구간만 직접 조회하도록 아래 run_adaptive_backward_fallback()이
+# 이 캐시를 활용한다). mart_name별로 따로 저장해 apt_rtt_mart/apt_mkt_trends_mart가 서로
+# 캐시를 덮어쓰지 않게 한다.
+DORMANT_STATE_DIR = "_dormant_apt_state"
+DORMANT_STATE_FILE = "data.parquet"
+
+
+def _dormant_state_path(lake_bucket: str, mart_name: str) -> str:
+    return f"s3://{lake_bucket}/mart/{mart_name}/{DORMANT_STATE_DIR}/{DORMANT_STATE_FILE}"
+
+
+def _load_dormant_state(
+    con: duckdb.DuckDBPyConnection, lake_bucket: str, mart_name: str
+) -> dict[tuple[str, str, str], date]:
+    """이전 실행에서 저장해둔 "단지 키 -> 최신 거래일자" 캐시를 읽는다. 캐시 파일이 아직
+    없으면(첫 실행 등) 빈 dict를 반환한다 - 이 경우 전부 기존처럼 처음부터 탐색한다."""
+    path = _dormant_state_path(lake_bucket, mart_name)
+    try:
+        rows = con.execute(
+            f"SELECT sgg_cd, dong_cd, apt_name, latest_deal_date "
+            f"FROM read_parquet('{path}', hive_partitioning=false)"
+        ).fetchall()
+    except Exception:
+        return {}
+
+    state: dict[tuple[str, str, str], date] = {}
+    for sgg_cd, dong_cd, apt_name, latest_deal_date_str in rows:
+        try:
+            state[(sgg_cd, dong_cd, apt_name)] = datetime.strptime(
+                latest_deal_date_str, "%Y-%m-%d"
+            ).date()
+        except (TypeError, ValueError):
+            # 손상되었거나 형식이 다른 행 하나 때문에 캐시 전체를 못 쓰게 되진 않도록 건너뛴다.
+            continue
+    return state
+
+
+def _save_dormant_state(
+    con: duckdb.DuckDBPyConnection,
+    lake_bucket: str,
+    mart_name: str,
+    state: dict[tuple[str, str, str], date],
+) -> None:
+    """이번 실행 기준 "여전히 미거래 상태인 단지 -> 최신 거래일자" 캐시를 통째로 다시 쓴다
+    (이번 실행에서 다시 거래가 확인된 단지는 호출부에서 이미 state 밖으로 빠져 있어, 여기서
+    자연스럽게 캐시에서도 사라진다). state가 비어 있으면(폴백 대상 자체가 없는 정상 케이스)
+    빈 파일을 쓰는 대신 그대로 둔다."""
+    if not state:
+        return
+    path = _dormant_state_path(lake_bucket, mart_name)
+    df = pl.DataFrame(
+        {
+            "sgg_cd": [k[0] for k in state],
+            "dong_cd": [k[1] for k in state],
+            "apt_name": [k[2] for k in state],
+            "latest_deal_date": [v.strftime("%Y-%m-%d") for v in state.values()],
+        },
+        schema={
+            "sgg_cd": pl.Utf8, "dong_cd": pl.Utf8, "apt_name": pl.Utf8,
+            "latest_deal_date": pl.Utf8,
+        },
+    )
+    con.register("_dormant_state_write", df)
+    con.execute(f"""
+        COPY (SELECT * FROM _dormant_state_write)
+        TO '{path}'
+        (FORMAT PARQUET, COMPRESSION SNAPPY)
+    """)
+    con.unregister("_dormant_state_write")
 
 
 def load_full_dim_apartment_keys(con: duckdb.DuckDBPyConnection) -> set:
@@ -116,18 +190,65 @@ def run_adaptive_backward_fallback(
             "unresolved_count": 0,
         }
 
-    print(
-        f"[INFO] {mart_name}: 기본 {lookback_days}일 구간에 거래가 없는 단지 "
-        f"{len(missing_keys)}건 발견 - 과거로 거슬러 올라가며 단지별 최신 거래일자 기준 "
-        f"최근 {lookback_days}일을 보강합니다(안전 상한: 추가 최대 {MAX_EXTRA_LOOKBACK_DAYS}일)."
-    )
-
-    searching: set = set(missing_keys)   # 아직 최신 거래일을 못 찾은 단지
-    collecting: dict = {}                 # 찾은 단지 -> latest_deal_date(수집 기준일)
     status_counts = {"insert": 0, "update": 0, "skip": 0}
     total_row_count = 0
     processed_day_count = 0
     extra_days_scanned = 0
+
+    # [2026-09-09 재실행 비용 절감] 이전 실행에서 이미 "이 단지의 최신 거래일자는 언제다"를
+    # 찾아둔 캐시(_load_dormant_state)를 확인한다. 이번에도 여전히 미거래 상태인 단지가
+    # 캐시에 있으면 탐색(searching) 없이 그 날짜 기준 lookback_days 구간만 곧바로 조회한다
+    # (Phase A). 캐시에 없는(이번에 처음 미거래로 확인된) 단지만 기존 방식대로 하루씩
+    # 거슬러 올라가며 탐색한다(Phase B) - 매 실행마다 전체 미거래 단지를 최대
+    # MAX_EXTRA_LOOKBACK_DAYS일씩 재탐색하던 비용을 단지당 1회로 줄이기 위함이다.
+    cached_state = _load_dormant_state(con, lake_bucket, mart_name)
+    resolved_keys = {key: cached_state[key] for key in missing_keys if key in cached_state}
+    new_missing_keys = missing_keys - resolved_keys.keys()
+
+    print(
+        f"[INFO] {mart_name}: 기본 {lookback_days}일 구간에 거래가 없는 단지 "
+        f"{len(missing_keys)}건 발견 (캐시로 즉시 재조회 {len(resolved_keys)}건 / "
+        f"신규 탐색 대상 {len(new_missing_keys)}건, 안전 상한: 추가 최대 "
+        f"{MAX_EXTRA_LOOKBACK_DAYS}일)."
+    )
+
+    # -------------------------------------------------------------------
+    # Phase A: 캐시에 이미 최신 거래일자가 있는 단지 - 탐색 없이 그 날짜 기준
+    # lookback_days 구간(day_to_keys)만 날짜별로 묶어 직접 조회한다.
+    # -------------------------------------------------------------------
+    if resolved_keys:
+        day_to_keys: dict[str, set] = {}
+        for key, latest in resolved_keys.items():
+            window_start = latest - timedelta(days=lookback_days - 1)
+            d = window_start
+            while d <= latest:
+                day_to_keys.setdefault(d.strftime("%Y-%m-%d"), set()).add(key)
+                d += timedelta(days=1)
+
+        for day_str in sorted(day_to_keys.keys()):
+            _register_interested_apts(con, day_to_keys[day_str])
+            raw_day_df = fetch_day_fn(con, lake_bucket, day_str, filter_table=INTERESTED_APTS_TABLE)
+            if raw_day_df.height > 0:
+                mart_day_df = shape_fn(raw_day_df)
+                status = upsert_fn(con, lake_bucket, day_str, mart_day_df)
+                status_counts[status] += 1
+                total_row_count += mart_day_df.height
+                processed_day_count += 1
+
+        print(
+            f"[INFO] {mart_name}: 캐시 기반 재조회 완료 - 단지 {len(resolved_keys)}건, "
+            f"조회한 날짜 {len(day_to_keys)}일(탐색 과정 생략)"
+        )
+
+    # -------------------------------------------------------------------
+    # Phase B: 캐시에 없는(신규) 미거래 단지 - 기존과 동일하게 하루씩 거슬러 올라가며
+    # 탐색(searching)과 수집(collecting)을 병행한다. discovered_dates는 발견 즉시(collecting에
+    # 넣는 시점) 기록해두어, 안전 상한에 걸려 수집이 끝까지 못 끝나더라도 "찾아낸 날짜"만큼은
+    # 캐시에 남겨 다음 실행이 이어받을 수 있게 한다.
+    # -------------------------------------------------------------------
+    searching: set = set(new_missing_keys)   # 아직 최신 거래일을 못 찾은 단지
+    collecting: dict = {}                     # 찾은 단지 -> latest_deal_date(수집 기준일)
+    discovered_dates: dict = {}               # 이번 실행에서 새로 찾아낸 단지 -> 최신 거래일자
 
     day = start_date - timedelta(days=1)
 
@@ -150,6 +271,7 @@ def run_adaptive_backward_fallback(
             newly_found = day_keys & searching
             for key in newly_found:
                 collecting[key] = day
+                discovered_dates[key] = day
             searching -= newly_found
 
             mart_day_df = shape_fn(raw_day_df)
@@ -179,12 +301,20 @@ def run_adaptive_backward_fallback(
         )
 
     print(
-        f"[INFO] {mart_name}: 적응형 조회기간 폴백 완료 - 추가로 거슬러 올라간 일수 "
-        f"{extra_days_scanned}일, 대상 단지 {len(missing_keys)}건 중 "
-        f"{len(missing_keys) - len(searching)}건 최신 거래일자 확인, 거래 존재 파티션 "
+        f"[INFO] {mart_name}: 적응형 조회기간 폴백 완료 - 신규 탐색으로 거슬러 올라간 일수 "
+        f"{extra_days_scanned}일, 신규 대상 단지 {len(new_missing_keys)}건 중 "
+        f"{len(discovered_dates)}건 최신 거래일자 확인, 거래 존재 파티션 "
         f"{processed_day_count}개 처리 (Insert {status_counts['insert']} / "
         f"Update {status_counts['update']} / Skip {status_counts['skip']})"
     )
+
+    # 다음 실행을 위한 캐시 갱신: 이번 실행 기준 여전히 미거래 상태인 단지(resolved_keys +
+    # 이번에 새로 찾은 discovered_dates)만 남긴다 - 이번에 다시 거래가 생겨 missing_keys에서
+    # 빠진 단지는 seen_apt_keys가 다음 실행에도 계속 잡아줄 것이므로 캐시에 남겨둘 필요가
+    # 없어 자연히 제외된다(위에서 이미 missing_keys 기준으로만 resolved_keys를 구성했음).
+    updated_state = dict(resolved_keys)
+    updated_state.update(discovered_dates)
+    _save_dormant_state(con, lake_bucket, mart_name, updated_state)
 
     return {
         "status_counts": status_counts,
