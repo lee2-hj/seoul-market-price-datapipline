@@ -25,8 +25,12 @@ from transformation.gold.dong_pyeong_common import (
     apt_select_cols,
     build_gold_mart_context,
 )
+from utils.spark_partition_upsert import upsert_spark_partition
 
 MART_NAME = "dm_apt_price_avg"
+# 단지 하나를 식별하는 비즈니스 키 (base_date 재실행 시 upsert 기준). latitude/longitude/
+# mno/sno는 같은 단지(cgg_cd+stdg_cd+bldg_nm)의 부가 속성이라 키에는 넣지 않는다.
+KEY_COLUMNS = ["cgg_cd", "stdg_cd", "bldg_nm"]
 
 
 def build(ctx: GoldMartContext) -> DataFrame:
@@ -51,8 +55,7 @@ def build(ctx: GoldMartContext) -> DataFrame:
 
 def run(ctx: GoldMartContext) -> None:
     mart_path = ctx.mart_paths[MART_NAME]
-    build(ctx).write.mode("overwrite").parquet(mart_path)
-    print(f"[INFO] ② {MART_NAME} 저장 완료: {mart_path}")
+    upsert_spark_partition(ctx.spark, mart_path, build(ctx), key_columns=KEY_COLUMNS, mart_label=f"② {MART_NAME}")
 
 
 if len(sys.argv) > 1:

@@ -38,6 +38,8 @@ from pyspark.sql.types import (
 from pyspark.sql.window import Window
 
 from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+from utils.geocode_cache import load_geocode_cache, save_geocode_cache, split_cached_and_missing
+from utils.spark_partition_upsert import upsert_spark_partition
 
 
 # =====================================================================================
@@ -311,13 +313,17 @@ def _first_verified_match(docs: list[dict], sgg_nm: str, dong_nm: str) -> dict |
 
 
 def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: str) -> tuple:
-    """(latitude, longitude)을 반환. 완전 실패 시 (None, None). 예외는 여기서 전부 흡수해
-    (Fallback 로직) 지오코딩 실패가 배치 전체를 죽이지 않도록 한다."""
+    """(latitude, longitude, is_exact_location)을 반환. 완전 실패 시 (None, None, False).
+    예외는 여기서 전부 흡수해(Fallback 로직) 지오코딩 실패가 배치 전체를 죽이지 않도록 한다.
+    is_exact_location은 1~3단계(지번/단지명 기반 정확 매칭)에서 찾으면 True, 4단계(법정동
+    대표 좌표) 폴백이면 False다 - [2026-09-09] dong_pyeong_common.py와 좌표 캐시
+    (geocode_cache, mart/_geocode_cache/)를 공유하게 되면서, 두 스크립트의 정확도 판정
+    기준을 반드시 맞춰야 캐시를 통해 값이 섞여도 문제가 없다."""
     cache_key = (sgg_nm, dong_nm, jibun, bldg_nm)
     if cache_key in _geocode_cache:
         return _geocode_cache[cache_key]
 
-    result = (None, None)
+    result = (None, None, False)
     if not KAKAO_MAP_REST_API_KEY:
         _geocode_cache[cache_key] = result
         return result
@@ -331,13 +337,13 @@ def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: st
                 sgg_nm, dong_nm,
             )
             if doc:
-                result = (float(doc["y"]), float(doc["x"]))
+                result = (float(doc["y"]), float(doc["x"]), True)
 
         # 2단계: 지번 전용 주소 검색 (필지 좌표)
         if result[0] is None and jibun:
             docs = _kakao_search(_KAKAO_ADDRESS_URL, f"{sgg_nm} {dong_nm} {jibun}")
             if docs:
-                result = (float(docs[0]["y"]), float(docs[0]["x"]))
+                result = (float(docs[0]["y"]), float(docs[0]["x"]), True)
 
         # 3단계: 정제 단지명 키워드 검색 + 주소/카테고리 검증
         if result[0] is None and clean_name:
@@ -346,13 +352,13 @@ def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: st
                 sgg_nm, dong_nm,
             )
             if doc:
-                result = (float(doc["y"]), float(doc["x"]))
+                result = (float(doc["y"]), float(doc["x"]), True)
 
         # 4단계: 법정동 대표 좌표 (최종 Fallback, 정확도 낮음)
         if result[0] is None:
             docs = _kakao_search(_KAKAO_KEYWORD_URL, f"{sgg_nm} {dong_nm}")
             if docs:
-                result = (float(docs[0]["y"]), float(docs[0]["x"]))
+                result = (float(docs[0]["y"]), float(docs[0]["x"]), False)
     except Exception as e:
         print(f"[WARN] 지오코딩 실패 (sgg_nm={sgg_nm}, dong_nm={dong_nm}, jibun={jibun}, bldg_nm={bldg_nm}): {e}")
 
@@ -382,14 +388,41 @@ distinct_apt_rows = (
 )
 print(f"[INFO] 지오코딩 대상 고유 단지 수: {len(distinct_apt_rows)}건")
 
-geocode_rows = []
-for row in distinct_apt_rows:
+# [2026-09-09 카카오맵 API 호출 절감] main_mart.py + dm_*.py 마트 4종이 서로 다른 프로세스로
+# 독립 실행되며(SparkSession 미공유) 매번 각자 다시 지오코딩했다(하루에 최대 5번 중복 호출).
+# 영구 캐시(geocode_cache, mart/_geocode_cache/)에 이미 있는 단지는 API를 호출하지 않고
+# 캐시값을 그대로 쓰고, 캐시에 없는(신규) 단지만 실제로 지오코딩한다. 이 캐시는
+# dong_pyeong_common.py(dm_*.py 4종)와 공유되므로, is_exact_location 판정 기준을 반드시
+# 맞춰야 한다(_geocode_apartment 함수 docstring 참고).
+_persistent_geocode_cache = load_geocode_cache(spark, LAKE_BUCKET)
+_resolved_from_cache, _distinct_apt_rows_to_call = split_cached_and_missing(
+    distinct_apt_rows, _persistent_geocode_cache
+)
+print(
+    f"[INFO] 카카오맵 지오코딩 캐시 재사용 {len(_resolved_from_cache)}건 / "
+    f"신규 호출 대상 {len(_distinct_apt_rows_to_call)}건"
+)
+
+geocode_rows = [
+    (key[0], key[1], key[2], value[0], value[1])
+    for key, value in _resolved_from_cache.items()
+]
+_newly_geocoded: dict[tuple, tuple] = {}
+for row in _distinct_apt_rows_to_call:
     mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
     jibun = _format_jibun(mno, sno)
-    latitude, longitude = _geocode_apartment(row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"])
+    latitude, longitude, is_exact = _geocode_apartment(row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"])
     geocode_rows.append((row["sgg_cd"], row["dong_cd"], row["apt_name"], latitude, longitude))
+    if latitude is not None:
+        _newly_geocoded[(row["sgg_cd"], row["dong_cd"], row["apt_name"])] = (latitude, longitude, is_exact)
 
-print(f"[INFO] 지오코딩 완료 (API 호출 대상 고유 캐시키 수: {len(_geocode_cache)}건)")
+print(f"[INFO] 지오코딩 완료 (신규 API 호출 대상 고유 캐시키 수: {len(_geocode_cache)}건)")
+
+# 다음 실행을 위한 캐시 갱신: 기존 캐시 전체를 유지한 채(불변 정보이므로 이번 실행에 다시
+# 등장하지 않은 단지도 지우지 않는다) 이번에 새로 찾은 좌표만 덧붙인다.
+_updated_geocode_cache = dict(_persistent_geocode_cache)
+_updated_geocode_cache.update(_newly_geocoded)
+save_geocode_cache(spark, LAKE_BUCKET, _updated_geocode_cache)
 
 
 def _sql_literal(value) -> str:
@@ -452,8 +485,9 @@ joined_df = joined_df.join(
 #      평당가"와 산식이 달라서 재사용하지 않고 여기서 새로 계산한다 - build_dong_pyeong_mart.py
 #      와 동일한 산식/상수를 사용).
 #    -> MinIO S3 Lake mart/dm_main/ 경로에 Parquet으로 저장.
-#    [멱등성] base_date=YYYY-MM-DD 전용 경로에 overwrite 모드로 쓰므로, 같은 base_date로
-#    몇 번을 다시 돌려도 그 경로 안의 파일만 최신 결과로 통째로 교체된다(누적/중복 없음).
+#    [멱등성/재실행] base_date=YYYY-MM-DD 전용 경로에 upsert_spark_partition()으로 쓴다 -
+#    파티션이 없으면 새로 저장(INSERT), 있는데 내용이 완전히 같으면 재작성을 건너뛰고(SKIP),
+#    다르면 키(cgg_cd+stdg_cd+bldg_nm+deal_date+area+mno+sno) 기준으로 병합(UPDATE)한다.
 # =====================================================================================
 SUPPLY_AREA_RATIO = 1.3  # 전용면적 -> 공급면적 환산 비율
 PYEONG_M2 = 3.30578       # 1평 = 3.30578 m2
@@ -493,8 +527,14 @@ main_mart_df = (
     )
 )
 
-main_mart_df.write.mode("overwrite").parquet(MART_PATH)
-print(f"[INFO] dm_main 저장 완료: {MART_PATH}")
+# [2026-09-09 base_date 재실행 대응] 같은 base_date로 하루에 여러 번 다시 돌려도(수동 재실행
+# 등) 매번 파티션 전체를 무조건 재작성하지 않고, 이전 저장 결과와 비교해 변경이 없으면
+# 재작성을 건너뛰고(SKIP), 있으면 [자치구x법정동x단지x거래일자x면적x지번] 키 기준으로
+# 병합(UPDATE)한다.
+MAIN_MART_KEY_COLUMNS = ["cgg_cd", "stdg_cd", "bldg_nm", "deal_date", "area", "mno", "sno"]
+upsert_spark_partition(
+    spark, MART_PATH, main_mart_df, key_columns=MAIN_MART_KEY_COLUMNS, mart_label="dm_main"
+)
 
 spark.stop()
 print("[INFO] Gold 마트 dm_main 저장 완료 (MinIO S3 Lake 전용, RDB 적재 없음)")

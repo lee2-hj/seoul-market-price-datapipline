@@ -25,8 +25,11 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, LongType
 
 from transformation.gold.dong_pyeong_common import GoldMartContext, build_gold_mart_context
+from utils.spark_partition_upsert import upsert_spark_partition
 
 MART_NAME = "dm_dong_pyeong_price_avg"
+# [자치구+법정동] 그룹 하나를 식별하는 비즈니스 키 (base_date 재실행 시 upsert 기준).
+KEY_COLUMNS = ["cgg_cd", "stdg_cd"]
 
 
 def build(ctx: GoldMartContext) -> DataFrame:
@@ -60,8 +63,9 @@ def build(ctx: GoldMartContext) -> DataFrame:
 
 def run(ctx: GoldMartContext) -> None:
     mart_path = ctx.mart_paths[MART_NAME]
-    build(ctx).write.mode("overwrite").parquet(mart_path)
-    print(f"[INFO] ① {MART_NAME} 저장 완료: {mart_path}")
+    # base_date 재실행(수동 재시도 등) 시 무조건 전체 재작성하지 않고, 변경 없으면 스킵,
+    # 있으면 KEY_COLUMNS 기준으로 병합한다.
+    upsert_spark_partition(ctx.spark, mart_path, build(ctx), key_columns=KEY_COLUMNS, mart_label=f"① {MART_NAME}")
 
 
 if len(sys.argv) > 1:

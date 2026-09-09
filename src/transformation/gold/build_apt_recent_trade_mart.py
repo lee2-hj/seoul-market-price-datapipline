@@ -38,6 +38,12 @@ from pyspark.sql.types import (
 )
 
 from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+from utils.building_info_cache import (
+    load_building_info_cache,
+    save_building_info_cache,
+    split_cached_and_missing,
+)
+from utils.spark_partition_upsert import upsert_spark_partition
 
 LOOKBACK_DAYS = 90
 SUPPLY_AREA_RATIO = 1.3   # 전용면적 -> 공급면적 환산 비율
@@ -538,14 +544,47 @@ def main():
     apartment_rows = collect_apartment_keys(agg_df)
     print(f"[INFO] 최근 {LOOKBACK_DAYS}일 거래가 있는 고유 아파트 수: {len(apartment_rows)}건")
 
+    # [2026-09-09 건축HUB API 호출 절감] 세대수/사용승인일은 건물 준공 시점에 정해지는
+    # 사실상 불변 정보라, 이전에 이미 조회에 성공한 단지는 영구 캐시(building_info_cache)에서
+    # 바로 가져오고 API를 다시 호출하지 않는다. 캐시에 없는(신규) 단지나 이전에 실패했던
+    # 단지만 실제로 API를 호출한다 - 일일 호출 한도를 매번 전체 단지 재조회에 낭비하지
+    # 않기 위함이다.
+    cached_building_info = load_building_info_cache(spark, config["lake_bucket"])
+    resolved_from_cache, apartment_rows_to_call = split_cached_and_missing(
+        apartment_rows, cached_building_info
+    )
+    print(
+        f"[INFO] 건축HUB API 캐시 재사용 {len(resolved_from_cache)}건 / "
+        f"신규 호출 대상 {len(apartment_rows_to_call)}건"
+    )
+
     try:
-        api_results = fetch_building_info_parallel(apartment_rows, config["data_go_kr_key"])
+        api_results = fetch_building_info_parallel(apartment_rows_to_call, config["data_go_kr_key"])
     except DailyTrafficExceededError:
         print("[ERROR] 공공데이터포털에서 일일트래픽이 초과되어 종료합니다")
         # 진행 중이던 캐시/집계 데이터를 모두 지우고, 저장(write) 없이 종료한다.
         agg_df.unpersist()
         spark.stop()
         sys.exit(1)
+
+    # 캐시로 즉시 해결된 결과 + 이번에 새로 API로 조회한 결과를 합쳐 최종 api_results를 만든다.
+    cached_results = [
+        {
+            "sgg_cd": key[0], "dong_cd": key[1], "apt_name": key[2],
+            "household_count": value[0], "use_approval_date": value[1],
+        }
+        for key, value in resolved_from_cache.items()
+    ]
+    api_results = cached_results + api_results
+
+    # 다음 실행을 위한 캐시 갱신: 기존 캐시 전체를 유지한 채(이번 실행에 다시 등장하지 않은
+    # 단지의 정보도 여전히 불변 정보이므로 지우지 않는다) 새로 성공한 결과만 덧붙인다.
+    updated_cache = dict(cached_building_info)
+    for result in api_results:
+        if result["household_count"] is not None or result["use_approval_date"] is not None:
+            key = (result["sgg_cd"], result["dong_cd"], result["apt_name"])
+            updated_cache[key] = (result["household_count"], result["use_approval_date"])
+    save_building_info_cache(spark, config["lake_bucket"], updated_cache)
 
     api_df = build_api_dataframe(spark, api_results)
 
@@ -557,12 +596,15 @@ def main():
     # - S3_END_POINT는 create_spark_session()에서 이미 s3a 커넥터 endpoint로 등록돼 있으므로,
     #   실제 URI 문자열 자체는 LAKE 버킷 기준 s3a://{LAKE}/... 형태로 구성한다
     #   (build_dong_pyeong_mart.py의 MART_PATHS와 동일한 규칙).
-    # - base_date별 경로에 overwrite 모드로 저장해, 같은 base_date로 몇 번을 다시 돌려도
-    #   그 경로 안의 파일만 최신 결과로 통째로 교체된다(멱등적으로 재실행 가능).
+    # - [2026-09-09 base_date 재실행 대응] 같은 base_date로 하루에 여러 번 다시 돌려도(수동
+    #   재실행 등) upsert_spark_partition()이 매번 무조건 전체 재작성하지 않고, 이전 저장
+    #   결과와 비교해 변경이 없으면 재작성을 건너뛰고(SKIP), 있으면 apt_id 기준으로
+    #   병합(UPDATE)한다. 파티션 자체가 없으면 그대로 새로 저장한다(INSERT).
     # -----------------------------------------------------------------------------
     mart_path = f"s3a://{config['lake_bucket']}/mart/dm_apt_recent_trade/base_date={base_date}"
-    gold_df.write.mode("overwrite").parquet(mart_path)
-    print(f"[INFO] dm_apt_recent_trade 저장 완료: {mart_path}")
+    upsert_spark_partition(
+        spark, mart_path, gold_df, key_columns=["apt_id"], mart_label="dm_apt_recent_trade"
+    )
 
     print("\n===== [SCHEMA] dm_apt_recent_trade =====")
     gold_df.printSchema()

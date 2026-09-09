@@ -33,6 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from transformation.gold.adaptive_lookback import load_fact_with_adaptive_lookback
+from utils.geocode_cache import load_geocode_cache, save_geocode_cache, split_cached_and_missing
 
 LOOKBACK_DAYS = 90
 SUPPLY_AREA_RATIO = 1.3  # 전용면적 -> 공급면적 환산 비율
@@ -565,8 +566,43 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     )
     print(f"[INFO] 지오코딩 대상 고유 단지 수: {len(distinct_apt_rows)}건")
 
-    geocode_rows = _geocode_apartments(distinct_apt_rows, jibun_lookup, kakao_api_key)
+    # [2026-09-09 카카오맵 API 호출 절감] 좌표는 사실상 불변 정보인데도 dm_*.py 마트 4종 +
+    # main_mart.py가 서로 다른 프로세스로 독립 실행되며(SparkSession 미공유) 매번 각자
+    # 다시 지오코딩했다(하루에 최대 5번 중복 호출). 영구 캐시(geocode_cache)에 이미 있는
+    # 단지는 API를 호출하지 않고 캐시값을 그대로 쓰고, 캐시에 없는(신규) 단지만 실제로
+    # 지오코딩한다.
+    cached_geocode = load_geocode_cache(spark, lake_bucket)
+    resolved_from_cache, distinct_apt_rows_to_call = split_cached_and_missing(
+        distinct_apt_rows, cached_geocode
+    )
+    print(
+        f"[INFO] 카카오맵 지오코딩 캐시 재사용 {len(resolved_from_cache)}건 / "
+        f"신규 호출 대상 {len(distinct_apt_rows_to_call)}건"
+    )
+
+    newly_geocoded_rows = _geocode_apartments(distinct_apt_rows_to_call, jibun_lookup, kakao_api_key)
+
+    # 캐시로 해결된 단지도 최종 출력 스키마(_geocode_rows_to_df, 8-tuple: ..., is_exact, mno,
+    # sno)에 맞춰야 한다. mno/sno는 geocode_cache에 저장하지 않으므로(이 API 호출과 무관하게
+    # 매 실행 Bronze에서 다시 계산되는 값) jibun_lookup에서 그대로 다시 가져온다.
+    cached_rows = []
+    for key, value in resolved_from_cache.items():
+        sgg_cd, dong_cd, apt_name = key
+        latitude, longitude, is_exact = value
+        mno, sno = jibun_lookup.get(key, (None, None))
+        cached_rows.append((sgg_cd, dong_cd, apt_name, latitude, longitude, is_exact, mno, sno))
+
+    geocode_rows = cached_rows + newly_geocoded_rows
     geocode_df = _geocode_rows_to_df(spark, geocode_rows)
+
+    # 다음 실행을 위한 캐시 갱신: 기존 캐시 전체를 유지한 채(이번 실행에 다시 등장하지 않은
+    # 단지의 좌표도 여전히 불변 정보이므로 지우지 않는다), 이번에 좌표를 새로 찾은 단지만
+    # 덧붙인다. 좌표를 아예 못 찾은 단지는 캐시에 남기지 않아 다음 실행에서 다시 시도된다.
+    updated_geocode_cache = dict(cached_geocode)
+    for sgg_cd, dong_cd, apt_name, latitude, longitude, is_exact, _mno, _sno in newly_geocoded_rows:
+        if latitude is not None:
+            updated_geocode_cache[(sgg_cd, dong_cd, apt_name)] = (latitude, longitude, is_exact)
+    save_geocode_cache(spark, lake_bucket, updated_geocode_cache)
 
     joined_df = joined_df.join(
         broadcast(geocode_df),
