@@ -136,6 +136,8 @@ spark = (
     .config("spark.hadoop.fs.s3a.access.key", S3_ACCESS_KEY)
     .config("spark.hadoop.fs.s3a.secret.key", S3_SECRET_KEY)
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.fast.upload", "true")
+    .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true" if S3_USE_SSL else "false")
     .getOrCreate()
@@ -155,7 +157,7 @@ spark.sparkContext.setLogLevel("WARN")
 #      -> 불필요한 Full Scan을 피하는 최적화).
 # =====================================================================================
 dim_apartment_df = spark.table("lakehouse.dim_apartment").select(
-    "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name"
+    "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "mno", "sno"
 )
 
 fact_df = (
@@ -166,7 +168,7 @@ fact_df = (
     .select(
         "sgg_cd", "dong_cd", "apt_name",
         "price_ten_thousand", "exclusive_area_m2", "deal_date",
-        "cancel_date", "mno", "sno",
+        "cancel_date", "mno", "sno", "apartment_match_status",
     )
 )
 
@@ -201,20 +203,23 @@ joined_df = (
             F.col("f.sgg_cd") == F.col("d.sgg_cd"),
             F.col("f.dong_cd") == F.col("d.dong_cd"),
             F.col("f.apt_name") == F.col("d.apt_name"),
+            F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
+            F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
         ],
-        how="inner",
+        how="left",
     )
     .select(
         F.col("f.sgg_cd").alias("sgg_cd"),
         F.col("d.sgg_nm").alias("sgg_nm"),
         F.col("f.dong_cd").alias("dong_cd"),
         F.trim(F.col("d.dong_nm")).alias("dong_nm"),
-        F.trim(F.col("d.apt_name")).alias("apt_name"),
+        F.trim(F.col("f.apt_name")).alias("apt_name"),
         F.col("f.price_ten_thousand").alias("price_ten_thousand"),
         F.col("f.exclusive_area_m2").alias("exclusive_area_m2"),
         F.col("f.deal_date").alias("deal_date"),
         F.col("f.mno").alias("mno"),
         F.col("f.sno").alias("sno"),
+        F.col("f.apartment_match_status").alias("apartment_match_status"),
     )
 ).cache()  # 아래 7번(지오코딩용 distinct collect)과 8번(최종 집계)이 이 결과를 재사용하므로
            # 캐싱하지 않으면 원천 읽기+조인이 두 번 실행된다.
@@ -234,6 +239,8 @@ joined_df = (
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from apartment_location_cache import load_success_cache, upsert_locations
 
 _KAKAO_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 _KAKAO_ADDRESS_URL = "https://dapi.kakao.com/v2/local/search/address.json"
@@ -325,7 +332,7 @@ def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: st
     if cache_key in _geocode_cache:
         return _geocode_cache[cache_key]
 
-    result = (None, None)
+    result = (None, None, False)
     if not KAKAO_MAP_REST_API_KEY:
         _geocode_cache[cache_key] = result
         return result
@@ -339,13 +346,13 @@ def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: st
                 sgg_nm, dong_nm,
             )
             if doc:
-                result = (float(doc["y"]), float(doc["x"]))
+                result = (float(doc["y"]), float(doc["x"]), True)
 
         # 2단계: 지번 전용 주소 검색 (필지 좌표)
         if result[0] is None and jibun:
             docs = _kakao_search(_KAKAO_ADDRESS_URL, f"{sgg_nm} {dong_nm} {jibun}")
             if docs:
-                result = (float(docs[0]["y"]), float(docs[0]["x"]))
+                result = (float(docs[0]["y"]), float(docs[0]["x"]), True)
 
         # 3단계: 정제 단지명 키워드 검색 + 주소/카테고리 검증
         if result[0] is None and clean_name:
@@ -354,13 +361,13 @@ def _geocode_apartment(sgg_nm: str, dong_nm: str, jibun: str | None, bldg_nm: st
                 sgg_nm, dong_nm,
             )
             if doc:
-                result = (float(doc["y"]), float(doc["x"]))
+                result = (float(doc["y"]), float(doc["x"]), True)
 
         # 4단계: 법정동 대표 좌표 (최종 Fallback, 정확도 낮음)
         if result[0] is None:
             docs = _kakao_search(_KAKAO_KEYWORD_URL, f"{sgg_nm} {dong_nm}")
             if docs:
-                result = (float(docs[0]["y"]), float(docs[0]["x"]))
+                result = (float(docs[0]["y"]), float(docs[0]["x"]), False)
     except Exception as e:
         print(f"[WARN] 지오코딩 실패 (sgg_nm={sgg_nm}, dong_nm={dong_nm}, jibun={jibun}, bldg_nm={bldg_nm}): {e}")
 
@@ -386,16 +393,33 @@ jibun_lookup = {
 
 # --- 7-2. 이번 배치 대상 고유 단지 순회 + 지오코딩 실행 (distinct로 단지당 1회 호출만) ---
 distinct_apt_rows = (
-    joined_df.select("sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name").distinct().collect()
+    joined_df
+    .filter(F.col("sgg_nm").isNotNull() & F.col("dong_nm").isNotNull())
+    .select("sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "mno", "sno")
+    .distinct()
+    .collect()
 )
 print(f"[INFO] 지오코딩 대상 고유 단지 수: {len(distinct_apt_rows)}건")
 
 geocode_rows = []
+persistent_location_cache = load_success_cache(spark)
 for row in distinct_apt_rows:
-    mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
+    mno, sno = row["mno"], row["sno"]
+    if mno is None:
+        mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
     jibun = _format_jibun(mno, sno)
-    latitude, longitude = _geocode_apartment(row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"])
-    geocode_rows.append((row["sgg_cd"], row["dong_cd"], row["apt_name"], latitude, longitude))
+    location_key = (row["sgg_cd"], row["dong_cd"], row["apt_name"], mno, sno)
+    cached = persistent_location_cache.get(location_key)
+    if cached is None:
+        latitude, longitude, is_exact = _geocode_apartment(
+            row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"]
+        )
+    else:
+        latitude, longitude, is_exact = cached
+    geocode_rows.append((
+        row["sgg_cd"], row["dong_cd"], row["apt_name"], latitude, longitude,
+        is_exact, mno, sno,
+    ))
 
 print(f"[INFO] 지오코딩 완료 (API 호출 대상 고유 캐시키 수: {len(_geocode_cache)}건)")
 
@@ -406,6 +430,8 @@ def _sql_literal(value) -> str:
     해야 한다 - Spark SQL 파서는 ''를 이스케이프로 인식하지 않고 그냥 통째로 삼켜버린다."""
     if value is None:
         return "NULL"
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, float):
         return f"{value!r}D"  # 'D' 접미사로 DoubleType 리터럴임을 명시 (기본은 DecimalType)
     escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
@@ -418,6 +444,9 @@ geocode_schema = StructType([
     StructField("apt_name", StringType(), True),
     StructField("latitude", DoubleType(), True),
     StructField("longitude", DoubleType(), True),
+    StructField("is_exact_location", BooleanType(), True),
+    StructField("mno", StringType(), True),
+    StructField("sno", StringType(), True),
 ])
 
 if geocode_rows:
@@ -426,15 +455,16 @@ if geocode_rows:
     # 대신 순수 Spark SQL VALUES 절로 만들면 JVM 안에서만 파싱/평가되어 파이썬 워커가
     # 전혀 필요 없다 (건수도 최대 수천 건 수준이라 SQL 문자열 크기는 문제없다).
     values_sql = ",\n".join(
-        "({}, {}, {}, {}, {})".format(
+        "({}, {}, {}, {}, {}, {}, {}, {})".format(
             _sql_literal(sgg_cd), _sql_literal(dong_cd), _sql_literal(apt_name),
-            _sql_literal(latitude), _sql_literal(longitude),
+            _sql_literal(latitude), _sql_literal(longitude), _sql_literal(is_exact),
+            _sql_literal(mno), _sql_literal(sno),
         )
-        for sgg_cd, dong_cd, apt_name, latitude, longitude in geocode_rows
+        for sgg_cd, dong_cd, apt_name, latitude, longitude, is_exact, mno, sno in geocode_rows
     )
     geocode_df = spark.sql(
         f"SELECT * FROM VALUES {values_sql} "
-        "AS t(sgg_cd, dong_cd, apt_name, latitude, longitude)"
+        "AS t(sgg_cd, dong_cd, apt_name, latitude, longitude, is_exact_location, mno, sno)"
     )
     # VALUES 절의 한 컬럼이 NULL 리터럴로만 채워지면(예: 이번 배치의 모든 단지가 지오코딩에
     # 실패) Spark가 그 컬럼 타입을 DoubleType이 아니라 VOID(NullType)로 추론해버린다. VOID
@@ -445,11 +475,27 @@ if geocode_rows:
 else:
     geocode_df = spark.createDataFrame([], schema=geocode_schema)
 
+upsert_locations(spark, geocode_df)
+
 # 좌표는 단지(sgg_cd+dong_cd+apt_name)당 하나뿐인 소용량 데이터라 여기서도 브로드캐스트 조인.
-joined_df = joined_df.join(
-    broadcast(geocode_df),
-    on=["sgg_cd", "dong_cd", "apt_name"],
-    how="left",
+joined_df = (
+    joined_df.alias("j")
+    .join(
+        broadcast(geocode_df).alias("g"),
+        on=[
+            F.col("j.sgg_cd") == F.col("g.sgg_cd"),
+            F.col("j.dong_cd") == F.col("g.dong_cd"),
+            F.col("j.apt_name") == F.col("g.apt_name"),
+            F.coalesce(F.col("j.mno"), F.lit("")) == F.coalesce(F.col("g.mno"), F.lit("")),
+            F.coalesce(F.col("j.sno"), F.lit("")) == F.coalesce(F.col("g.sno"), F.lit("")),
+        ],
+        how="left",
+    )
+    .select(
+        "j.*", F.col("g.latitude").alias("latitude"),
+        F.col("g.longitude").alias("longitude"),
+        F.col("g.is_exact_location").alias("is_exact_location"),
+    )
 )
 
 
@@ -476,6 +522,7 @@ main_mart_df = (
     .groupBy(
         "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name",
         "deal_date", "exclusive_area_m2", "mno", "sno", "latitude", "longitude",
+        "is_exact_location", "apartment_match_status",
     )
     .agg(
         F.count(F.lit(1)).cast(IntegerType()).alias("deal_cnt"),
@@ -495,6 +542,8 @@ main_mart_df = (
         "sno",
         "latitude",
         "longitude",
+        "is_exact_location",
+        "apartment_match_status",
         "deal_cnt",
         "total_thing_amt",
         "total_pyeong_amt",
