@@ -65,7 +65,7 @@ PYEONG_M2 = 3.30578          # 1평 = 3.30578 m2 (전용면적 기준 평수 환
 # dim_apartment는 파티션이 없어 data/ 밑에 바로 parquet이 있고, fact_apt_transactions는
 # Iceberg 테이블 생성 시 PARTITIONED BY (days(deal_date))로 만들어져 있어(Real_Estate_Transform.py
 # 참고) data/deal_date_day=YYYY-MM-DD/*.parquet 형태로 중첩되어 있다.
-DIM_APARTMENT_GLOB = "dim_apartment/data/*.parquet"
+DIM_APARTMENT_GLOB = "dim_apartment_current/*.parquet"
 
 # [2026-08-30 SIGABRT 장애 대응 - apt_rtt_mart.py와 동일 패턴] 90일 전체를 재귀 글롭(**)으로
 # 한 번에 조회하던 이전 방식은 raw_df/mart_df/partition_by() 복사본이 동시에 메모리에 떠 있어,
@@ -76,7 +76,7 @@ DIM_APARTMENT_GLOB = "dim_apartment/data/*.parquet"
 # 장애가 재현될 것으로 보고 선제적으로 동일하게 고친다 - main()이 90일을 순회하며 하루치씩
 # 이 글롭으로 그날 파티션 디렉터리 하나만 직접 지정해 조회한다(재귀 글롭 1회로 90개 디렉터리를
 # 매번 다시 나열하지 않아도 되는 부수 효과도 apt_rtt_mart.py와 동일).
-FACT_APT_TRANSACTIONS_DAY_GLOB = "fact_apt_transactions/data/deal_date_day={day}/*.parquet"
+FACT_APT_TRANSACTIONS_DAY_GLOB = "fact_apt_transactions_current/deal_date_day={day}/*.parquet"
 
 # 최종 마트 이름/저장 경로: {S3_END_POINT}/{LAKE}/mart/apt_mkt_trends/base_date=YYYY-MM-DD/data.parquet
 # 파일명을 고정값(PARTITION_FILE_NAME)으로 둬서, 같은 base_date를 몇 번을 다시 써도(Update)
@@ -194,7 +194,7 @@ def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: st
     print(f"[INFO] dim_apartment 브로드캐스트 테이블 구체화: {s3_path}")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE dim_apartment_bc AS
-        SELECT DISTINCT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name
+        SELECT DISTINCT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name, mno, sno
         FROM read_parquet('{s3_path}')
     """)
     # fetchone()은 정적으로 tuple | None으로 추론되어(COUNT(*)가 항상 한 행을 반환한다는 사실을
@@ -239,11 +239,11 @@ def fetch_joined_day(
     )
     query = f"""
         SELECT
-            d.sgg_cd  AS sgg_cd,
+            f.sgg_cd  AS sgg_cd,
             d.sgg_nm  AS sgg_nm,
-            d.dong_cd AS dong_cd,
+            f.dong_cd AS dong_cd,
             d.dong_nm AS dong_nm,
-            d.apt_name AS apt_name,
+            f.apt_name AS apt_name,
             f.mno AS mno,
             f.sno AS sno,
             f.deal_date AS deal_date,
@@ -260,7 +260,7 @@ def fetch_joined_day(
               AND exclusive_area_m2 > 0
               AND mno IS NOT NULL AND TRIM(mno) <> ''
         ) AS f
-        INNER JOIN dim_apartment_bc AS d
+        LEFT JOIN dim_apartment_bc AS d
             ON f.sgg_cd = d.sgg_cd
            AND f.dong_cd = d.dong_cd
            AND f.apt_name = d.apt_name
@@ -438,7 +438,8 @@ def upsert_partition(
     #    키는 그대로 남고(보존), new_day_df에만 있던 키는 자연히 추가된다(=Insert). 순수 신규
     #    키 건수는 join(how='anti')로 별도 집계해 로그에 남긴다.
     new_only_count = new_day_df.join(old_df, on="record_key", how="anti").height
-    merged = pl.concat([old_df, new_day_df]).unique(subset=["record_key"], keep="last")
+    # 현재 Silver 스냅샷이 해당 날짜의 권위 있는 전체 집합이므로 삭제/취소된 과거 키를 보존하지 않는다.
+    merged = new_day_df
     write_partition_file(con, lake_bucket, day_str, drop_technical_columns(merged))
     print(
         f"[UPDATE] base_date={day_str}: 기존 {old_df.height}건 + 신규수집 {new_day_df.height}건 "

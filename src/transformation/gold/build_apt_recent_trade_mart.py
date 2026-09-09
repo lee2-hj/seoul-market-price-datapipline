@@ -193,6 +193,8 @@ def create_spark_session(config: dict) -> SparkSession:
         .config("spark.hadoop.fs.s3a.access.key", config["s3_access_key"])
         .config("spark.hadoop.fs.s3a.secret.key", config["s3_secret_key"])
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.fast.upload", "true")
+        .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true" if use_ssl else "false")
         .getOrCreate()
@@ -206,7 +208,7 @@ def create_spark_session(config: dict) -> SparkSession:
 # =====================================================================================
 def load_dim_apartment(spark: SparkSession) -> DataFrame:
     return spark.table("lakehouse.dim_apartment").select(
-        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year"
+        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year", "mno", "sno", "apartment_id"
     )
 
 
@@ -250,15 +252,13 @@ def aggregate_recent_trades(
         .withColumn("price_per_pyeong", F.col("price_ten_thousand") / F.col("supply_pyeong"))
     )
 
-    return fact_df.groupBy("sgg_cd", "dong_cd", "apt_name").agg(
+    return fact_df.groupBy("sgg_cd", "dong_cd", "apt_name", "mno", "sno").agg(
         F.round(F.sum("price_ten_thousand")).cast(LongType()).alias("total_trade_amount"),
         F.round(F.sum("price_per_pyeong")).cast(LongType()).alias("total_price_per_pyeong"),
         F.round(F.sum("supply_pyeong"), 2).cast(DoubleType()).alias("total_pyeong"),
         F.round(F.max_by("price_ten_thousand", "deal_date")).cast(LongType()).alias("latest_trade_amount"),
         F.round(F.max_by("supply_pyeong", "deal_date"), 2).cast(DoubleType()).alias("latest_trade_pyeong"),
         F.count(F.lit(1)).cast(IntegerType()).alias("trade_count"),
-        F.first("mno", ignorenulls=True).alias("mno"),
-        F.first("sno", ignorenulls=True).alias("sno"),
     )
 
 
@@ -453,6 +453,8 @@ def build_gold_mart(agg_df: DataFrame, dim_df: DataFrame, api_df: DataFrame) -> 
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
+                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
+                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
             how="inner",
         )
@@ -497,7 +499,7 @@ def build_gold_mart(agg_df: DataFrame, dim_df: DataFrame, api_df: DataFrame) -> 
 
     return joined_df.select(
         # 아파트 식별자/이름/위치 정보 (dim_apartment 기준)
-        F.concat_ws("-", F.col("d.sgg_cd"), F.col("d.dong_cd"), F.col("d.apt_name")).alias("apt_id"),
+        F.col("d.apartment_id").alias("apt_id"),
         F.col("d.apt_name").alias("apt_name"),
         F.col("d.sgg_cd").alias("sgg_cd"),
         F.col("d.sgg_nm").alias("sgg_nm"),

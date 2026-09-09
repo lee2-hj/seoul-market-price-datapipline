@@ -147,6 +147,8 @@ def _create_spark_session(
         .config("spark.hadoop.fs.s3a.access.key", s3_access_key)
         .config("spark.hadoop.fs.s3a.secret.key", s3_secret_key)
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.fast.upload", "true")
+        .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true" if use_ssl else "false")
         .getOrCreate()
@@ -314,6 +316,7 @@ def _geocode_apartments(
     distinct_apt_rows,
     jibun_lookup: dict[tuple, tuple],
     kakao_api_key: str | None,
+    persistent_cache: dict[tuple, tuple],
 ) -> list[tuple]:
     """고유 단지 목록을 순회하며 지오코딩하고, (sgg_cd, dong_cd, apt_name, latitude,
     longitude, is_exact_location, mno, sno) 튜플 리스트를 돌려준다."""
@@ -389,9 +392,19 @@ def _geocode_apartments(
     rows = []
     exact_count = 0
     for row in distinct_apt_rows:
-        mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
+        row_values = row.asDict()
+        mno, sno = row_values.get("mno"), row_values.get("sno")
+        if mno is None:
+            mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
         jibun = _format_jibun(mno, sno)
-        latitude, longitude, is_exact = geocode_apartment(row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"])
+        location_key = (row["sgg_cd"], row["dong_cd"], row["apt_name"], mno, sno)
+        cached = persistent_cache.get(location_key)
+        if cached is None:
+            latitude, longitude, is_exact = geocode_apartment(
+                row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"]
+            )
+        else:
+            latitude, longitude, is_exact = cached
         exact_count += 1 if is_exact else 0
         # mno/sno는 위에서 jibun_lookup으로 조회해둔 값을 그대로 실어 나른다 - Bronze를
         # 다시 스캔하지 않고, 지오코딩에 쓰던 것과 동일한 대표 지번을 마트 출력에도 노출한다.
@@ -506,7 +519,7 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     # (days(deal_date))로 만들어져 있어서(Real_Estate_Transform.py 참고) deal_date 조건이
     # Iceberg의 파티션 프루닝에 그대로 활용된다 - 최근 90일 day 파티션만 실제로 읽힌다.
     dim_apartment_df = spark.table("lakehouse.dim_apartment").select(
-        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name"
+        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "mno", "sno"
     )
     # 적응형 조회기간 폴백(adaptive_lookback.py): 기본 90일 구간(빠른 경로, 파티션 프루닝)을
     # 우선 읽고, dim_apartment에는 있지만 그 구간에 거래가 없는 단지에 한해 전체 이력에서
@@ -535,19 +548,23 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
+                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
+                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
-            how="inner",
+            how="left",
         )
         .select(
             F.col("f.sgg_cd").alias("sgg_cd"),
             F.col("d.sgg_nm").alias("sgg_nm"),
             F.col("f.dong_cd").alias("dong_cd"),
             F.trim(F.col("d.dong_nm")).alias("dong_nm"),
-            F.trim(F.col("d.apt_name")).alias("apt_name"),
+            F.trim(F.col("f.apt_name")).alias("apt_name"),
             F.col("f.price_ten_thousand").alias("price_ten_thousand"),
             F.col("f.exclusive_area_m2").alias("exclusive_area_m2"),
             F.col("f.floor").alias("floor"),
             F.col("f.deal_date").alias("deal_date"),
+            F.col("f.mno").alias("mno"),
+            F.col("f.sno").alias("sno"),
         )
     ).cache()  # 아래 지오코딩용 distinct collect와 공통 df 집계가 이 결과를 재사용하므로
                # 캐싱하지 않으면 원천 읽기+조인이 두 번 실행된다.
@@ -562,7 +579,11 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     jibun_lookup = _build_jibun_lookup(spark, raw_bucket, start_date, base_date)
 
     distinct_apt_rows = (
-        joined_df.select("sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name").distinct().collect()
+        joined_df
+        .filter(F.col("sgg_nm").isNotNull() & F.col("dong_nm").isNotNull())
+        .select("sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "mno", "sno")
+        .distinct()
+        .collect()
     )
     print(f"[INFO] 지오코딩 대상 고유 단지 수: {len(distinct_apt_rows)}건")
 
@@ -604,10 +625,24 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
             updated_geocode_cache[(sgg_cd, dong_cd, apt_name)] = (latitude, longitude, is_exact)
     save_geocode_cache(spark, lake_bucket, updated_geocode_cache)
 
-    joined_df = joined_df.join(
-        broadcast(geocode_df),
-        on=["sgg_cd", "dong_cd", "apt_name"],
-        how="left",
+    joined_df = (
+        joined_df.alias("j")
+        .join(
+            broadcast(geocode_df).alias("g"),
+            on=[
+                F.col("j.sgg_cd") == F.col("g.sgg_cd"),
+                F.col("j.dong_cd") == F.col("g.dong_cd"),
+                F.col("j.apt_name") == F.col("g.apt_name"),
+                F.coalesce(F.col("j.mno"), F.lit("")) == F.coalesce(F.col("g.mno"), F.lit("")),
+                F.coalesce(F.col("j.sno"), F.lit("")) == F.coalesce(F.col("g.sno"), F.lit("")),
+            ],
+            how="left",
+        )
+        .select(
+            "j.*", F.col("g.latitude").alias("latitude"),
+            F.col("g.longitude").alias("longitude"),
+            F.col("g.is_exact_location").alias("is_exact_location"),
+        )
     )
 
     # --- 평형대(PYEONG_GRP) / 층수 그룹(FLR_GRP) 분류 + 거래건별 평당가 산출 ---

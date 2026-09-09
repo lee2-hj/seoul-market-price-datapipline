@@ -12,7 +12,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
 from pyspark.sql.types import DecimalType
-from pyspark.sql.utils import AnalysisException
+from pyspark.errors import AnalysisException
 from pyspark.sql.window import Window
 
 
@@ -28,10 +28,16 @@ from pyspark.sql.window import Window
 #      기동하면 매번 JVM/Iceberg 카탈로그 초기화 비용이 반복돼 느리다).
 #    - 인자 없음: 어제 날짜를 기본값으로 사용 (데일리 배치용)
 # =====================================================================================
+CUTOVER_APARTMENT_KEY_V2 = len(sys.argv) > 1 and sys.argv[1].upper() == "CUTOVER_APARTMENT_KEY_V2"
+PREPARE_APARTMENT_KEY_V2 = len(sys.argv) > 1 and sys.argv[1].upper() == "PREPARE_APARTMENT_KEY_V2"
 BULK_MODE = len(sys.argv) > 1 and sys.argv[1].upper() == "BULK"
 target_dates: list[str] = []  # YYYYMMDD 문자열 목록 (BULK_MODE가 아닐 때만 채워짐)
 
-if BULK_MODE:
+if CUTOVER_APARTMENT_KEY_V2:
+    print("[INFO] 처리 모드: CUTOVER_APARTMENT_KEY_V2")
+elif PREPARE_APARTMENT_KEY_V2:
+    print("[INFO] 처리 모드: PREPARE_APARTMENT_KEY_V2 (기존 테이블 변경 없음)")
+elif BULK_MODE:
     print("[INFO] 처리 모드: BULK (전체 기간 일괄 백필, SparkSession 1회 기동)")
 else:
     if len(sys.argv) > 1:
@@ -61,6 +67,30 @@ RAW_BUCKET = os.getenv("RAW")
 LAKE_BUCKET = os.getenv("LAKE")
 
 LAKE_WAREHOUSE = f"s3a://{LAKE_BUCKET}/"
+DIM_APARTMENT_CURRENT_PATH = f"s3a://{LAKE_BUCKET}/dim_apartment_current"
+FACT_APT_TRANSACTIONS_CURRENT_PATH = f"s3a://{LAKE_BUCKET}/fact_apt_transactions_current"
+
+
+def _export_current_dim_apartment() -> None:
+    """Iceberg 현재 스냅샷을 DuckDB Gold 작업용 Parquet 스냅샷으로 게시한다."""
+    (
+        spark.table("lakehouse.dim_apartment")
+        .select(
+            "apartment_id", "sgg_cd", "sgg_nm", "dong_cd", "dong_nm",
+            "apt_name", "mno", "sno", "build_year",
+        )
+        .write.mode("overwrite")
+        .parquet(DIM_APARTMENT_CURRENT_PATH)
+    )
+    print(f"[INFO] dim_apartment 현재 스냅샷 게시 완료: {DIM_APARTMENT_CURRENT_PATH}")
+    (
+        spark.table("lakehouse.fact_apt_transactions")
+        .withColumn("deal_date_day", F.date_format("deal_date", "yyyy-MM-dd"))
+        .write.mode("overwrite")
+        .partitionBy("deal_date_day")
+        .parquet(FACT_APT_TRANSACTIONS_CURRENT_PATH)
+    )
+    print(f"[INFO] fact_apt_transactions 현재 스냅샷 게시 완료: {FACT_APT_TRANSACTIONS_CURRENT_PATH}")
 
 # S3_END_POINT는 로컬(MinIO, 스킴 없이 "host:port")과 배포(HTTPS 스킴 포함,
 # 예: "https://storage.googleapis.com") 양쪽 형식을 그대로 받는다. SSL 사용 여부는
@@ -144,6 +174,10 @@ spark = (
     .config("spark.hadoop.fs.s3a.access.key", S3_ACCESS_KEY)
     .config("spark.hadoop.fs.s3a.secret.key", S3_SECRET_KEY)
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    # Windows 로컬 실행에서는 Hadoop native DLL 불일치로 디스크 버퍼 생성이 실패할 수 있다.
+    # S3A 업로드 블록을 메모리에 두어 NativeIO.access0 의존을 피한다.
+    .config("spark.hadoop.fs.s3a.fast.upload", "true")
+    .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true" if S3_USE_SSL else "false")
     .config("spark.hadoop.fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") # 배포시 오류 해결을 위해 
@@ -165,7 +199,10 @@ spark.sql("""
         dong_cd    STRING,
         dong_nm    STRING,
         apt_name   STRING,
-        build_year STRING
+        build_year STRING,
+        mno        STRING,
+        sno        STRING,
+        apartment_id STRING
     )
     USING iceberg
 """)
@@ -184,7 +221,18 @@ spark.sql("""
         cancel_date         STRING,
         agent_sgg_nm        STRING,
         mno                 STRING,
-        sno                 STRING
+        sno                 STRING,
+        apartment_match_status STRING
+    )
+    USING iceberg
+    PARTITIONED BY (days(deal_date))
+""")
+
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS lakehouse.fact_apt_transactions_quarantine (
+        deal_date DATE, sgg_cd STRING, dong_cd STRING, apt_name STRING,
+        mno STRING, sno STRING, floor INT, exclusive_area_m2 DECIMAL(10,2),
+        apartment_match_status STRING, quarantined_at TIMESTAMP
     )
     USING iceberg
     PARTITIONED BY (days(deal_date))
@@ -195,12 +243,165 @@ spark.sql("""
 # 여부를 확인해 없을 때만 Iceberg 스키마 진화(ADD COLUMNS)로 추가한다 - 기존 행은
 # 전혀 건드리지 않고(새 컬럼은 자동으로 NULL) 매 실행(BULK/데일리/다중 날짜)마다 안전하게 반복 가능하다.
 _existing_fact_columns = set(spark.table("lakehouse.fact_apt_transactions").columns)
-if "mno" not in _existing_fact_columns or "sno" not in _existing_fact_columns:
+_required_fact_columns = {
+    "mno": "STRING",
+    "sno": "STRING",
+    "apartment_match_status": "STRING",
+}
+_missing_fact_columns = {
+    name: data_type
+    for name, data_type in _required_fact_columns.items()
+    if name not in _existing_fact_columns
+}
+if _missing_fact_columns:
     print("[INFO] fact_apt_transactions에 mno/sno 컬럼이 없어 스키마 진화(ADD COLUMNS)로 추가합니다.")
-    spark.sql("""
+    spark.sql(f"""
         ALTER TABLE lakehouse.fact_apt_transactions
-        ADD COLUMNS (mno STRING, sno STRING)
+        ADD COLUMNS (
+            {", ".join(f"{name} {data_type}" for name, data_type in _missing_fact_columns.items())}
+        )
     """)
+
+
+def _prepare_apartment_key_v2() -> None:
+    """Build non-destructive v2/preview tables before the production cutover."""
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS lakehouse.dim_apartment_v2 (
+            sgg_cd STRING, sgg_nm STRING, dong_cd STRING, dong_nm STRING,
+            apt_name STRING, build_year STRING, mno STRING, sno STRING,
+            apartment_id STRING
+        ) USING iceberg
+    """)
+    spark.sql("""
+        INSERT OVERWRITE lakehouse.dim_apartment_v2
+        SELECT
+            f.sgg_cd, max(d.sgg_nm), f.dong_cd, max(d.dong_nm), f.apt_name,
+            max(d.build_year), f.mno, f.sno,
+            sha2(concat_ws('|', coalesce(f.sgg_cd, ''), coalesce(f.dong_cd, ''),
+                coalesce(f.apt_name, ''), coalesce(f.mno, ''), coalesce(f.sno, '')), 256)
+        FROM lakehouse.fact_apt_transactions f
+        LEFT JOIN lakehouse.dim_apartment d
+          ON f.sgg_cd = d.sgg_cd
+         AND f.dong_cd = d.dong_cd
+         AND f.apt_name = d.apt_name
+        GROUP BY f.sgg_cd, f.dong_cd, f.apt_name, f.mno, f.sno
+    """)
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS lakehouse.fact_apt_quality_v2_preview (
+            apartment_match_status STRING, row_count BIGINT
+        ) USING iceberg
+    """)
+    spark.sql("""
+        INSERT OVERWRITE lakehouse.fact_apt_quality_v2_preview
+        SELECT apartment_match_status, count(*) AS row_count
+        FROM (
+            SELECT CASE
+                WHEN coalesce(trim(f.sgg_cd), '') = ''
+                  OR coalesce(trim(f.dong_cd), '') = ''
+                  OR coalesce(trim(f.apt_name), '') = '' THEN 'INVALID_JOIN_KEY'
+                WHEN d.apartment_id IS NULL THEN 'UNMATCHED'
+                ELSE 'MATCHED'
+            END AS apartment_match_status
+            FROM lakehouse.fact_apt_transactions f
+            LEFT JOIN lakehouse.dim_apartment_v2 d
+              ON f.sgg_cd = d.sgg_cd
+             AND f.dong_cd = d.dong_cd
+             AND f.apt_name = d.apt_name
+             AND coalesce(f.mno, '') = coalesce(d.mno, '')
+             AND coalesce(f.sno, '') = coalesce(d.sno, '')
+        ) quality
+        GROUP BY apartment_match_status
+    """)
+
+    source_count_row = spark.sql("""
+        SELECT count(*) AS count FROM (
+            SELECT DISTINCT sgg_cd, dong_cd, apt_name, mno, sno
+            FROM lakehouse.fact_apt_transactions
+        )
+    """).first()
+    if source_count_row is None:
+        raise RuntimeError("source_count 조회 결과가 없습니다.")
+    source_count = source_count_row["count"]
+    v2_count = spark.table("lakehouse.dim_apartment_v2").count()
+    if source_count != v2_count:
+        raise RuntimeError(f"v2 검증 실패: source={source_count}, v2={v2_count}")
+    print(f"[INFO] dim_apartment_v2 검증 완료: {v2_count}건")
+    spark.table("lakehouse.fact_apt_quality_v2_preview").show(truncate=False)
+    print("[INFO] 기존 dim/fact는 변경하지 않았습니다.")
+
+
+if PREPARE_APARTMENT_KEY_V2:
+    _prepare_apartment_key_v2()
+    spark.stop()
+    sys.exit(0)
+
+
+def _cutover_apartment_key_v2() -> None:
+    preview = {
+        row["apartment_match_status"]: row["row_count"]
+        for row in spark.table("lakehouse.fact_apt_quality_v2_preview").collect()
+    }
+    fact_count = spark.table("lakehouse.fact_apt_transactions").count()
+    if preview.get("MATCHED", 0) != fact_count or sum(preview.values()) != fact_count:
+        raise RuntimeError(f"전환 중단: preview={preview}, fact_count={fact_count}")
+
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS lakehouse.dim_apartment_backup_20260908
+        USING iceberg AS SELECT * FROM lakehouse.dim_apartment
+    """)
+    backup_count = spark.table("lakehouse.dim_apartment_backup_20260908").count()
+    current_count = spark.table("lakehouse.dim_apartment").count()
+    if backup_count != current_count:
+        raise RuntimeError(f"백업 검증 실패: backup={backup_count}, current={current_count}")
+
+    spark.sql("""
+        CREATE OR REPLACE TABLE lakehouse.dim_apartment
+        USING iceberg AS SELECT * FROM lakehouse.dim_apartment_v2
+    """)
+    spark.sql("""
+        MERGE INTO lakehouse.fact_apt_transactions target
+        USING (
+            SELECT f.deal_date, f.sgg_cd, f.dong_cd, f.apt_name, f.mno, f.sno,
+                   f.floor, f.exclusive_area_m2,
+                   CASE
+                     WHEN coalesce(trim(f.sgg_cd), '') = ''
+                       OR coalesce(trim(f.dong_cd), '') = ''
+                       OR coalesce(trim(f.apt_name), '') = '' THEN 'INVALID_JOIN_KEY'
+                     WHEN d.apartment_id IS NULL THEN 'UNMATCHED'
+                     ELSE 'MATCHED'
+                   END AS apartment_match_status
+            FROM lakehouse.fact_apt_transactions f
+            LEFT JOIN lakehouse.dim_apartment d
+              ON f.sgg_cd = d.sgg_cd
+             AND f.dong_cd = d.dong_cd
+             AND f.apt_name = d.apt_name
+             AND coalesce(f.mno, '') = coalesce(d.mno, '')
+             AND coalesce(f.sno, '') = coalesce(d.sno, '')
+        ) source
+        ON target.deal_date = source.deal_date
+       AND target.sgg_cd = source.sgg_cd
+       AND target.dong_cd = source.dong_cd
+       AND target.apt_name = source.apt_name
+       AND coalesce(target.mno, '') = coalesce(source.mno, '')
+       AND coalesce(target.sno, '') = coalesce(source.sno, '')
+       AND target.floor <=> source.floor
+       AND target.exclusive_area_m2 <=> source.exclusive_area_m2
+        WHEN MATCHED THEN UPDATE SET
+          target.apartment_match_status = source.apartment_match_status
+    """)
+    remaining_nulls = spark.table("lakehouse.fact_apt_transactions").filter(
+        F.col("apartment_match_status").isNull()
+    ).count()
+    if remaining_nulls:
+        raise RuntimeError(f"품질 백필 검증 실패: NULL={remaining_nulls}")
+    print(f"[INFO] 운영 전환 완료: backup={backup_count}, dim_v2={spark.table('lakehouse.dim_apartment').count()}, fact={fact_count}")
+
+
+if CUTOVER_APARTMENT_KEY_V2:
+    _cutover_apartment_key_v2()
+    _export_current_dim_apartment()
+    spark.stop()
+    sys.exit(0)
 
 
 # =====================================================================================
@@ -325,8 +526,14 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
     # 5-5. Dimension(dim_apartment) MERGE INTO 방식 Upsert - 고유 키: sgg_cd, dong_cd, apt_name
     # -----------------------------------------------------------------------------
     dim_source_df = silver_df.select(
-        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year"
-    ).dropDuplicates(["sgg_cd", "dong_cd", "apt_name"])
+        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year", "mno", "sno"
+    ).dropDuplicates(["sgg_cd", "dong_cd", "apt_name", "mno", "sno"]).withColumn(
+        "apartment_id",
+        F.sha2(F.concat_ws("|", *[
+            F.coalesce(F.col(name), F.lit(""))
+            for name in ("sgg_cd", "dong_cd", "apt_name", "mno", "sno")
+        ]), 256),
+    )
 
     dim_source_df.createOrReplaceTempView("dim_apartment_source")
 
@@ -382,8 +589,11 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
+                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
+                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
-            how="inner",
+            # 거래를 기준으로 보존한다. 마스터 미매칭 여부는 아래 품질 상태로 명시한다.
+            how="left",
         )
         .select(
             "f.deal_date",
@@ -513,4 +723,5 @@ spark.table("lakehouse.dim_apartment").show(5, truncate=False)
 print("\n===== [VALIDATION] lakehouse.fact_apt_transactions 상위 5건 =====")
 spark.table("lakehouse.fact_apt_transactions").show(5, truncate=False)
 
+_export_current_dim_apartment()
 spark.stop()
