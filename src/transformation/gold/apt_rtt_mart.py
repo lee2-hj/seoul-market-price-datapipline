@@ -515,6 +515,17 @@ def main() -> None:
     # 추가로 채운다(adaptive_lookback_duckdb.py 모듈 docstring 참고). 대다수 실행에서는
     # 이런 단지가 없어 즉시 반환되며 추가 비용이 없다.
     # -----------------------------------------------------------------------------
+    # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응 - apt_mkt_trends_mart.py와 동일
+    # 원인/동일 조치] 콜드스타트 폴백(dormant_state 캐시가 비어 수천 개 단지 전부를 최대
+    # 1,095일씩 하루 단위로 탐색해야 하는 경우) 도중 이 스크립트도 같은 함수/같은 반복
+    # 조회 패턴을 공유하므로 동일한 OOM이 재현될 수 있다. 위 메인 90일 루프가 이미 써버린
+    # (그리고 온전히 반환되지 않았을 수 있는) 메모리 상태 위에서 폴백이 이어지지 않도록,
+    # 폴백 직전에 커넥션을 통째로 닫고 새로 열어(dim_apartment_bc도 새 커넥션에 다시
+    # 구체화 - 비용 무시할 수준) 깨끗한 메모리에서 폴백을 시작한다.
+    con.close()
+    con = get_duckdb_connection(config)
+    load_dim_apartment_broadcast(con, lake_bucket)
+
     fallback_result = run_adaptive_backward_fallback(
         con,
         lake_bucket,

@@ -559,6 +559,21 @@ def main() -> None:
         fallback_rows.append(drop_technical_columns(df))
         return "skip"
 
+    # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응] 위에서 이미 여러 조치(불필요한
+    # 임시테이블 재등록 생략, insertion order 보존 끄기, 주기적 gc.collect() - 전부
+    # adaptive_lookback_duckdb.py)를 적용했는데도 콜드스타트 폴백(dormant_state 캐시가
+    # 비어 수천 개 단지 전부를 최대 1,095일씩 하루 단위로 탐색해야 하는 경우)에서
+    # "ArrowBuffer: failed to allocate ... bytes" OOM이 계속 재현됐다. 폴백은 위 90일
+    # 메인 루프(87개 파티션 처리)보다 훨씬 무거운 반복을 이어가는데, 같은 DuckDB
+    # 커넥션을 계속 재사용하다 보니 메인 루프가 이미 써버린(그리고 온전히 반환되지
+    # 않았을 수 있는) 메모리 상태 위에서 폴백이 시작된다. 폴백 직전에 커넥션을 통째로
+    # 닫고 새로 열어(dim_apartment_bc도 새 커넥션에 다시 구체화 - 7,165건뿐이라 비용
+    # 무시할 수준) 메인 루프가 남긴 상태와 완전히 무관한 깨끗한 메모리에서 폴백을
+    # 시작하도록 한다. 이후 코드는 재할당된 con을 그대로 이어서 쓴다.
+    con.close()
+    con = get_duckdb_connection(config)
+    load_dim_apartment_broadcast(con, lake_bucket)
+
     fallback_result = run_adaptive_backward_fallback(
         con,
         lake_bucket,
