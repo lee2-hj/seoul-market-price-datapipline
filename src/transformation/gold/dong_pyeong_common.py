@@ -541,7 +541,11 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
         base_date=base_date,
         start_date=start_date,
         lookback_days=LOOKBACK_DAYS,
-        extra_select_cols=("floor",),
+        # [2026-09-10] 아래 joined_df.select()가 f.mno/f.sno(지번)도 함께 뽑아 쓰는데
+        # (main_mart.py와 동일한 이유로 발생한 UNRESOLVED_COLUMN 재현 - 이 함수가 반환하는
+        # fact_df는 extra_select_cols에 없는 컬럼은 애초에 프로젝션하지 않는다), "floor"만
+        # 넘기면 f.mno/f.sno가 fact_df에 없어 AnalysisException으로 즉시 실패한다.
+        extra_select_cols=("floor", "mno", "sno"),
     )
 
     # --- dim_apartment 브로드캐스트 조인 (소용량 마스터 테이블을 브로드캐스트해서

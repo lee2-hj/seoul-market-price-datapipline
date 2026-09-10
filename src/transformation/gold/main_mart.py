@@ -183,7 +183,11 @@ fact_df = load_fact_with_adaptive_lookback(
     base_date=base_date,
     start_date=start_date,
     lookback_days=LOOKBACK_DAYS,
-    extra_select_cols=("mno", "sno"),
+    # [2026-09-10] 아래 joined_df.select()가 f.apartment_match_status도 함께 뽑아 쓰는데,
+    # load_fact_with_adaptive_lookback()은 extra_select_cols에 없는 컬럼은 애초에
+    # 프로젝션하지 않는다(adaptive_lookback.py 참고). 이 컬럼이 빠져 있으면
+    # UNRESOLVED_COLUMN AnalysisException으로 즉시 실패한다(2026-09-10 GCP 운영 환경 재현).
+    extra_select_cols=("mno", "sno", "apartment_match_status"),
 )
 
 
