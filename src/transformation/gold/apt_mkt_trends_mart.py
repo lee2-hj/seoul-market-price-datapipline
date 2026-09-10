@@ -286,7 +286,8 @@ def fetch_joined_day(
         {extra_join}
     """
     try:
-        return con.execute(query).pl()
+        con.execute(f"COPY ({query}) TO '/tmp/_duck_day.parquet' (FORMAT PARQUET)")
+        return pl.read_parquet('/tmp/_duck_day.parquet')
     except duckdb.IOException:
         # 해당 날짜에 거래가 아예 없어 파티션 디렉터리 자체가 없는 경우(S3 404 계열) - 빈
         # 결과(0건)로 간주하고 넘어간다(read_existing_partition()과 동일한 예외 처리 패턴).
