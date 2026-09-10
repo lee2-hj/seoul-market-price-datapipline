@@ -349,7 +349,20 @@ def fetch_building_info(row: Row, api_key: str) -> dict:
                     f"retryable status code {response.status_code}", response=response
                 )
             response.raise_for_status()
-            items = response.json().get("response", {}).get("body", {}).get("items")
+            # [2026-09-10] 공공데이터포털 API는 정상 200 응답이면서도 (서비스키 미등록/일시
+            # 오류/해당 지번 데이터 없음 등의 이유로) "response"나 "body"가 키는 있되 값이
+            # null인 응답을 종종 돌려준다("response": null, "body": null 등). 이전에는
+            # .get("response", {})의 default {}가 "키가 아예 없을 때"만 적용되고 "값이
+            # None으로 명시된 경우"에는 적용되지 않아, 그다음 .get("body", ...) 호출이
+            # AttributeError('NoneType' object has no attribute 'get')를 던졌다. 이
+            # AttributeError는 requests.exceptions.RequestException이 아니라서 아래 except에
+            # 잡히지 않고 그대로 스레드 밖으로 전파되어 fetch_building_info_parallel()의
+            # future.result()에서 재발생, main() 전체를 크래시시켰다(이 함수 docstring이
+            # 약속한 "실패하면 None으로 채운 dict를 반환하고 배치는 계속 진행"이 지켜지지
+            # 않는 버그). "or {}"로 값이 None이어도 항상 dict로 정규화해 이 경로 자체를
+            # 없앤다.
+            response_body = (response.json().get("response") or {}).get("body") or {}
+            items = response_body.get("items") if isinstance(response_body, dict) else None
             item = (items or {}).get("item") if isinstance(items, dict) else None
             if isinstance(item, list):
                 item = item[0] if item else None
@@ -358,7 +371,11 @@ def fetch_building_info(row: Row, api_key: str) -> dict:
                 result["household_count"] = item.get("hhldCnt")
                 result["use_approval_date"] = _normalize_use_approval_date(item.get("useAprDay"))
             return result
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError, AttributeError, TypeError, KeyError) as e:
+            # [2026-09-10] 위 정규화로도 못 막을 수 있는 그 밖의 예상 밖 응답 형태(JSON 파싱
+            # 실패, "response"/"body"가 dict가 아닌 다른 타입 등)까지 방어선으로 함께 잡는다 -
+            # 이 함수가 애초에 약속한 "실패 시 None으로 채운 결과 반환, 배치는 계속 진행"과
+            # 동일하게 재시도 후 폴백 처리되도록 한다(네트워크 오류와 동일하게 취급).
             last_error = e
             if attempt < API_MAX_RETRIES:
                 time.sleep(API_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))

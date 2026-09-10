@@ -191,7 +191,16 @@ def _parse_real_estate_json(response_text: str, operation_name: str) -> tuple[in
 
     if body is None:
         # SERVICE_NAME 래퍼가 없는 응답: 최상위 RESULT를 직접 본다.
-        result = payload.get("RESULT", {})
+        # [2026-09-10] .get("RESULT", {})의 default {}는 "RESULT" 키가 아예 없을 때만
+        # 적용되고, 공공데이터포털이 종종 내려주는 "RESULT": null 형태의 응답에는 적용되지
+        # 않아 None이 그대로 반환된다 - 그러면 바로 다음 줄 result.get("CODE")가
+        # AttributeError('NoneType' object has no attribute 'get')를 던진다. 이 AttributeError는
+        # 아래에서 기대하는 RuntimeError가 아니라서 _fetch_page의 논리적 오류 재시도 루프도
+        # 못 잡고, 특히 probe 요청(fetch_real_estate 최초 1건 조회)에서 발생하면 아무 보호
+        # 장치 없이 task_fetch_real_estate 전체를 그대로 크래시시킨다. "or {}"로 None이어도
+        # 항상 dict로 정규화해, 의도한 대로 RuntimeError(원인 메시지 포함)로 안전하게
+        # 종료되게 한다.
+        result = payload.get("RESULT") or {}
         result_code = result.get("CODE")
         if result_code == "INFO-200":
             # "해당하는 데이터가 없습니다" - 에러가 아니라 정상적인 0건 응답이다.
@@ -199,7 +208,8 @@ def _parse_real_estate_json(response_text: str, operation_name: str) -> tuple[in
         result_msg = result.get("MESSAGE")
         raise RuntimeError(f"{operation_name} 실패: CODE={result_code}, MESSAGE={result_msg}")
 
-    result = body.get("RESULT", {})
+    # 위와 동일한 이유("RESULT": null 응답 방어)로 body 쪽도 or {}로 정규화한다.
+    result = body.get("RESULT") or {}
     result_code = result.get("CODE")
     if result_code != "INFO-000":
         result_msg = result.get("MESSAGE")
