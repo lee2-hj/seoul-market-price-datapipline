@@ -612,7 +612,7 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
         f"신규 호출 대상 {len(distinct_apt_rows_to_call)}건"
     )
 
-    newly_geocoded_rows = _geocode_apartments(distinct_apt_rows_to_call, jibun_lookup, kakao_api_key)
+    newly_geocoded_rows = _geocode_apartments(distinct_apt_rows_to_call, jibun_lookup, kakao_api_key, cached_geocode)
 
     # 캐시로 해결된 단지도 최종 출력 스키마(_geocode_rows_to_df, 8-tuple: ..., is_exact, mno,
     # sno)에 맞춰야 한다. mno/sno는 geocode_cache에 저장하지 않으므로(이 API 호출과 무관하게
