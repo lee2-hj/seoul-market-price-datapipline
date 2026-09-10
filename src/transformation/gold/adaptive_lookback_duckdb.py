@@ -242,89 +242,106 @@ def run_adaptive_backward_fallback(
         )
 
     # -------------------------------------------------------------------
-    # Phase B: 캐시에 없는(신규) 미거래 단지 - 기존과 동일하게 하루씩 거슬러 올라가며
-    # 탐색(searching)과 수집(collecting)을 병행한다. discovered_dates는 발견 즉시(collecting에
-    # 넣는 시점) 기록해두어, 안전 상한에 걸려 수집이 끝까지 못 끝나더라도 "찾아낸 날짜"만큼은
-    # 캐시에 남겨 다음 실행이 이어받을 수 있게 한다.
+    # Phase B: 캐시에 없는(신규) 미거래 단지 - 하루씩 거슬러 올라가며 탐색(searching)과
+    # 수집(collecting)을 병행한다. discovered_dates는 발견 즉시(collecting에 넣는 시점)
+    # 기록해두어, 안전 상한에 걸려 수집이 끝까지 못 끝나더라도 "찾아낸 날짜"만큼은 캐시에
+    # 남겨 다음 실행이 이어받을 수 있게 한다.
+    #
+    # [2026-09-10 OOM 근본 대응] 콜드스타트(캐시가 비어 신규 탐색 대상이 수천 건)에서는
+    # 실측 결과 fact_apt_transactions_current가 2023-01-29부터 데이터가 있어(약 1,020개
+    # 날짜 파티션 중 대부분에 실제 거래 존재) 대부분의 반복이 IOException으로 빠르게
+    # 건너뛰어지는 게 아니라 매번 실제로 read_parquet+조인+Arrow(.pl()) 변환을 수행한다.
+    # 이 전체 신규 탐색 대상을 한 번에 "관심 대상"으로 등록해두고 스캔하면(과거 코드),
+    # 재등록 생략/insertion order 보존 끄기/주기적 gc.collect()/폴백 직전 커넥션
+    # 재생성까지 적용해도 "OutOfMemoryException: ArrowBuffer: failed to allocate ...
+    # bytes"가 반복 재현됐다 - 반복 "횟수"만 줄이는 조치로는 부족했고, 매 반복의 "결과
+    # 크기"(수천 개 단지를 상대로 한 조인 결과) 자체가 문제였던 것으로 보인다. 그래서
+    # 신규 탐색 대상을 ADAPTIVE_LOOKBACK_BATCH_SIZE(기본 500)개씩 작은 배치로 나눠,
+    # 배치 하나씩 완전히 독립된 searching/collecting/day 상태로 하루씩 거슬러 올라가는
+    # 스캔을 수행한다 - 한 번에 관심 대상으로 등록되는 단지 수와 조인 결과 크기가 훨씬
+    # 작아져 개별 쿼리의 메모리 사용량이 크게 줄어든다(총 스캔 일수는 배치 수만큼 늘 수
+    # 있지만, 그만큼 각 반복이 다루는 데이터는 작아진다). 탐색/수집 로직 자체와 최종적으로
+    # 찾아내는 단지/날짜/데이터는 배치로 나누기 전과 완전히 동일하다 - 배치 경계는 순전히
+    # 메모리 안전을 위한 것이지, 어떤 단지가 어느 배치에 들어가든 그 단지 자신의
+    # searching/collecting 판정에는 다른 배치의 존재가 전혀 영향을 주지 않는다.
     # -------------------------------------------------------------------
-    searching: set = set(new_missing_keys)   # 아직 최신 거래일을 못 찾은 단지
-    collecting: dict = {}                     # 찾은 단지 -> latest_deal_date(수집 기준일)
-    discovered_dates: dict = {}               # 이번 실행에서 새로 찾아낸 단지 -> 최신 거래일자
+    BATCH_SIZE = int(os.getenv("ADAPTIVE_LOOKBACK_BATCH_SIZE", "500"))
+    new_missing_list = sorted(new_missing_keys)
+    total_batches = (len(new_missing_list) + BATCH_SIZE - 1) // BATCH_SIZE if new_missing_list else 0
 
-    day = start_date - timedelta(days=1)
+    discovered_dates: dict = {}   # 이번 실행에서 새로 찾아낸 단지 -> 최신 거래일자(모든 배치 합산)
+    still_searching: set = set()  # 안전 상한에 걸려 이번 실행에서 못 찾은 단지(모든 배치 합산)
 
-    # [2026-09-10 OOM 대응] dormant_state 캐시가 비어있어(첫 실행 등) missing_keys 전체가
-    # new_missing_keys로 넘어오면, 이 while 루프가 안전 상한(MAX_EXTRA_LOOKBACK_DAYS, 기본
-    # 1095일)까지 하루 단위로 계속 돌 수 있다. 그런데 그 대부분의 날짜는 거래가 아예 없어서
-    # (raw_day_df.height == 0) searching/collecting 집합이 전혀 안 바뀌는데도, 예전 코드는
-    # 매 반복마다 무조건 _register_interested_apts()로 새 Arrow 테이블을 등록 ->
-    # CREATE OR REPLACE TEMP TABLE -> 등록 해제를 반복했다. 이 재등록 자체는 논리적으로
-    # 무해하지만(내용이 같으면 결과도 같음), 이력이 없는 오래된 구간이 수백~1000일 넘게
-    # 이어지는 콜드스타트에서는 이 반복 횟수만큼 DuckDB/Arrow 쪽 임시 객체가 쌓여
-    # "OutOfMemoryException: ArrowBuffer: failed to allocate ... bytes"로 죽는 게 실제로
-    # 재현됐다(2026-09-10, 3,806개 단지가 전부 캐시 미스라 처음부터 끝까지 탐색해야 했던
-    # apt_mkt_trends_mart.py 실행). interested 집합이 실제로 바뀐 경우에만 재등록하도록
-    # 바꿔 이 불필요한 반복 재생성을 없앤다 - 조회 결과(찾아내는 단지/날짜)는 이전과
-    # 완전히 동일하다.
-    _previous_interested: frozenset | None = None
+    for batch_no, batch_start in enumerate(range(0, len(new_missing_list), BATCH_SIZE), start=1):
+        batch_keys = set(new_missing_list[batch_start:batch_start + BATCH_SIZE])
 
-    while (searching or collecting) and extra_days_scanned < MAX_EXTRA_LOOKBACK_DAYS:
-        interested = searching | set(collecting.keys())
-        _interested_frozen = frozenset(interested)
-        if _interested_frozen != _previous_interested:
-            _register_interested_apts(con, interested)
-            _previous_interested = _interested_frozen
+        searching: set = set(batch_keys)   # 아직 최신 거래일을 못 찾은 단지(이 배치만)
+        collecting: dict = {}               # 찾은 단지 -> latest_deal_date(수집 기준일)
+        day = start_date - timedelta(days=1)
+        batch_days_scanned = 0
+        # [2026-09-10 OOM 대응] interested 집합이 실제로 바뀐 경우에만 재등록해 불필요한
+        # 임시테이블 재생성을 없앤다 - 조회 결과(찾아내는 단지/날짜)는 이전과 완전히 동일하다.
+        _previous_interested: frozenset | None = None
 
-        raw_day_df = fetch_day_fn(con, lake_bucket, day.strftime("%Y-%m-%d"), filter_table=INTERESTED_APTS_TABLE)
+        while (searching or collecting) and batch_days_scanned < MAX_EXTRA_LOOKBACK_DAYS:
+            interested = searching | set(collecting.keys())
+            _interested_frozen = frozenset(interested)
+            if _interested_frozen != _previous_interested:
+                _register_interested_apts(con, interested)
+                _previous_interested = _interested_frozen
 
-        if raw_day_df.height > 0:
-            day_keys = set(
-                zip(
-                    raw_day_df["sgg_cd"].to_list(),
-                    raw_day_df["dong_cd"].to_list(),
-                    raw_day_df["apt_name"].to_list(),
+            raw_day_df = fetch_day_fn(con, lake_bucket, day.strftime("%Y-%m-%d"), filter_table=INTERESTED_APTS_TABLE)
+
+            if raw_day_df.height > 0:
+                day_keys = set(
+                    zip(
+                        raw_day_df["sgg_cd"].to_list(),
+                        raw_day_df["dong_cd"].to_list(),
+                        raw_day_df["apt_name"].to_list(),
+                    )
                 )
-            )
-            # 탐색 중이던 단지가 오늘 발견되면: 오늘이 바로 그 단지의 최신 거래일자다(더
-            # 최근 날짜는 이미 다 훑었는데 없었으므로).
-            newly_found = day_keys & searching
-            for key in newly_found:
-                collecting[key] = day
-                discovered_dates[key] = day
-            searching -= newly_found
+                # 탐색 중이던 단지가 오늘 발견되면: 오늘이 바로 그 단지의 최신 거래일자다(더
+                # 최근 날짜는 이미 다 훑었는데 없었으므로).
+                newly_found = day_keys & searching
+                for key in newly_found:
+                    collecting[key] = day
+                    discovered_dates[key] = day
+                searching -= newly_found
 
-            mart_day_df = shape_fn(raw_day_df)
-            status = upsert_fn(con, lake_bucket, day.strftime("%Y-%m-%d"), mart_day_df)
-            status_counts[status] += 1
-            total_row_count += mart_day_df.height
-            processed_day_count += 1
+                mart_day_df = shape_fn(raw_day_df)
+                status = upsert_fn(con, lake_bucket, day.strftime("%Y-%m-%d"), mart_day_df)
+                status_counts[status] += 1
+                total_row_count += mart_day_df.height
+                processed_day_count += 1
 
-        # 수집 구간(latest_deal_date 기준 최근 lookback_days일)을 벗어난 단지는 더 이상
-        # 관심 대상이 아니므로 제거한다 - 오늘(day)이 구간 시작일에 도달했으면 이 단지는
-        # 오늘 처리를 끝으로 완료된 것이라 그다음 날(day-1)부터는 제외해야 한다.
-        finished = [
-            key for key, latest in collecting.items()
-            if day <= latest - timedelta(days=lookback_days - 1)
-        ]
-        for key in finished:
-            del collecting[key]
+            # 수집 구간(latest_deal_date 기준 최근 lookback_days일)을 벗어난 단지는 더 이상
+            # 관심 대상이 아니므로 제거한다 - 오늘(day)이 구간 시작일에 도달했으면 이 단지는
+            # 오늘 처리를 끝으로 완료된 것이라 그다음 날(day-1)부터는 제외해야 한다.
+            finished = [
+                key for key, latest in collecting.items()
+                if day <= latest - timedelta(days=lookback_days - 1)
+            ]
+            for key in finished:
+                del collecting[key]
 
-        day -= timedelta(days=1)
-        extra_days_scanned += 1
+            day -= timedelta(days=1)
+            batch_days_scanned += 1
 
-        # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응 - 위 재등록 생략/insertion
-        # order 끄기 조치로도 해결 안 됨] 실측 결과 fact_apt_transactions_current는
-        # 2023-01-29부터 데이터가 있어(약 1,020개 날짜 파티션 중 대부분에 실제 거래 존재),
-        # 콜드스타트 폴백(캐시가 비어 3,806개 단지 전부 탐색 필요)은 대부분의 반복에서
-        # IOException으로 빠르게 건너뛰어지는 게 아니라 실제로 read_parquet+조인+
-        # Arrow(.pl()) 변환을 매번 수행한다. 매 반복이 만드는 DuckDB/Arrow/Polars 결과
-        # 객체가 단순 참조 카운트만으로는 바로 회수되지 않고(C 확장 객체 간 순환 참조는
-        # 파이썬의 세대별 가비지 컬렉터가 나중에야 청소함) 반복 수백 회가 넘도록 계속
-        # 쌓이면서 DuckDB 메모리 추적기가 결국 OOM으로 죽는 것이 실제로 재현됐다. 일정
-        # 주기로 강제 가비지 컬렉션을 돌려 이 지연된 회수를 앞당긴다 - 탐색/폴백 로직이나
-        # 결과에는 전혀 영향이 없다.
-        if extra_days_scanned % 30 == 0:
-            gc.collect()
+            # 30회 반복마다 강제 가비지 컬렉션 - DuckDB/Arrow/Polars 결과 객체가 단순 참조
+            # 카운트만으로는 바로 회수되지 않는(C 확장 객체 간 순환 참조) 지연 회수를 앞당긴다.
+            if batch_days_scanned % 30 == 0:
+                gc.collect()
+
+        extra_days_scanned = max(extra_days_scanned, batch_days_scanned)
+        still_searching |= searching
+        gc.collect()  # 배치 하나가 끝날 때마다도 회수를 앞당긴다.
+
+        print(
+            f"[INFO] {mart_name}: 폴백 배치 {batch_no}/{total_batches} 완료 "
+            f"(단지 {len(batch_keys)}건, {batch_days_scanned}일 거슬러 올라감)"
+        )
+
+    searching = still_searching  # 아래 WARN/캐시 저장 블록이 그대로 쓸 수 있도록 이름을 유지한다.
 
     if searching:
         print(
