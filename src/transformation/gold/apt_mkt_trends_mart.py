@@ -192,9 +192,14 @@ def get_duckdb_connection(config: dict) -> duckdb.DuckDBPyConnection:
 def load_dim_apartment_broadcast(con: duckdb.DuckDBPyConnection, lake_bucket: str) -> None:
     s3_path = f"s3://{lake_bucket}/{DIM_APARTMENT_GLOB}"
     print(f"[INFO] dim_apartment 브로드캐스트 테이블 구체화: {s3_path}")
+    # [2026-09-10] mno/sno는 apartment_key_v2 컷오버 전까지 dim_apartment_current 스냅샷에
+    # 물리적으로 존재하지 않는다(Real_Estate_Transform.py의 _export_current_dim_apartment()
+    # 참고 - 컷오버 전 lakehouse.dim_apartment 자체에 이 컬럼이 없다). 조인 키도 apt_name
+    # 기준(모듈 상단 주석 참고)이고 최종 출력 mno/sno는 fact 쪽 값만 쓰므로, 이 브로드캐스트
+    # 테이블에서는 실제로 존재하는 컬럼만 선택한다.
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE dim_apartment_bc AS
-        SELECT DISTINCT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name, mno, sno
+        SELECT DISTINCT sgg_cd, sgg_nm, dong_cd, dong_nm, apt_name
         FROM read_parquet('{s3_path}')
     """)
     # fetchone()은 정적으로 tuple | None으로 추론되어(COUNT(*)가 항상 한 행을 반환한다는 사실을

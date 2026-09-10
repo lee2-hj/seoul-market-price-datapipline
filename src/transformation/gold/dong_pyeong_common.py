@@ -518,8 +518,14 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     # fact_apt_transactions: deal_date 컬럼으로 필터링한다. 이 테이블은 PARTITIONED BY
     # (days(deal_date))로 만들어져 있어서(Real_Estate_Transform.py 참고) deal_date 조건이
     # Iceberg의 파티션 프루닝에 그대로 활용된다 - 최근 90일 day 파티션만 실제로 읽힌다.
+    # [2026-09-10] mno/sno는 이 테이블 CREATE TABLE DDL(목표 스키마)에는 있지만
+    # apartment_key_v2 컷오버 전까지는 lakehouse.dim_apartment에 물리적으로 존재하지
+    # 않고(dim_apartment MERGE INTO도 채운 적이 없다), select하면 UNRESOLVED_COLUMN
+    # AnalysisException으로 즉시 실패한다(2026-09-09 GCP 운영 환경 재현). 지번은 아래에서
+    # fact_df(f.mno/f.sno, Silver 스키마 진화로 이미 채워져 있음)만으로 계속 사용하므로
+    # dim_apartment 쪽은 실제 존재하는 키 컬럼만 읽는다.
     dim_apartment_df = spark.table("lakehouse.dim_apartment").select(
-        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "mno", "sno"
+        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name"
     )
     # 적응형 조회기간 폴백(adaptive_lookback.py): 기본 90일 구간(빠른 경로, 파티션 프루닝)을
     # 우선 읽고, dim_apartment에는 있지만 그 구간에 거래가 없는 단지에 한해 전체 이력에서
@@ -542,14 +548,15 @@ def build_gold_mart_context(base_date: date) -> GoldMartContext:
     # Shuffle 최소화) + 건물명/동명 TRIM 공백 정제 ---
     joined_df = (
         fact_df.alias("f")
+        # dim_apartment는 mno/sno 컬럼이 없고(위 select 주석 참고) 실제 고유키는
+        # (sgg_cd, dong_cd, apt_name) 3개뿐이므로 그 키로만 조인한다. mno/sno는 아래 select에서
+        # f.mno/f.sno(fact 쪽 값)를 그대로 쓰므로 조인 조건에서 빠져도 결과에 영향이 없다.
         .join(
             broadcast(dim_apartment_df).alias("d"),
             on=[
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
-                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
-                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
             how="left",
         )

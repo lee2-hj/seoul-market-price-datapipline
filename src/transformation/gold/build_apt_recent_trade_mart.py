@@ -205,10 +205,17 @@ def create_spark_session(config: dict) -> SparkSession:
 
 # =====================================================================================
 # 3. dim_apartment 로드 (Broadcast Join에 쓸 컬럼만 선별)
+#    [2026-09-10] mno/sno/apartment_id는 이 스크립트 CREATE TABLE DDL(목표 스키마)에는
+#    적혀 있지만, apartment_key_v2 컷오버(Real_Estate_Transform.py CUTOVER_APARTMENT_KEY_V2)
+#    이전까지는 실제 운영 lakehouse.dim_apartment Iceberg 테이블에 물리적으로 존재하지
+#    않는다(dim_apartment MERGE INTO도 이 3컬럼은 채운 적이 없다 - 5-5 MERGE INTO 참고).
+#    여기서 select하면 UNRESOLVED_COLUMN.WITH_SUGGESTION AnalysisException으로 즉시 실패한다
+#    (2026-09-09 GCP 운영 환경 실제 재현). 컷오버 전까지는 dim_apartment의 실제 키(sgg_cd,
+#    dong_cd, apt_name)에 해당하는 컬럼만 읽는다.
 # =====================================================================================
 def load_dim_apartment(spark: SparkSession) -> DataFrame:
     return spark.table("lakehouse.dim_apartment").select(
-        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year", "mno", "sno", "apartment_id"
+        "sgg_cd", "sgg_nm", "dong_cd", "dong_nm", "apt_name", "build_year"
     )
 
 
@@ -447,14 +454,14 @@ def build_api_dataframe(spark: SparkSession, api_results: list[dict]) -> DataFra
 def build_gold_mart(agg_df: DataFrame, dim_df: DataFrame, api_df: DataFrame) -> DataFrame:
     joined_df = (
         agg_df.alias("f")
+        # [2026-09-10] dim_apartment는 mno/sno 컬럼이 없고(위 load_dim_apartment 주석 참고)
+        # 실제 고유키는 (sgg_cd, dong_cd, apt_name) 3개뿐이므로 그 키로만 조인한다.
         .join(
             broadcast(dim_df).alias("d"),
             on=[
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
-                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
-                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
             how="inner",
         )
@@ -499,7 +506,22 @@ def build_gold_mart(agg_df: DataFrame, dim_df: DataFrame, api_df: DataFrame) -> 
 
     return joined_df.select(
         # 아파트 식별자/이름/위치 정보 (dim_apartment 기준)
-        F.col("d.apartment_id").alias("apt_id"),
+        # [2026-09-10] dim_apartment.apartment_id는 실제로 존재/적재된 적이 없어(위 join 주석
+        # 참고) 참조할 수 없다. 이 결과가 upsert_spark_partition(key_columns=["apt_id"])의
+        # 병합 키로 쓰이므로, agg_df의 자연키(sgg_cd/dong_cd/apt_name/mno/sno - Step 1
+        # groupBy와 동일 granularity)를 Real_Estate_Transform.py의 dim_apartment_source
+        # apartment_id와 동일한 sha2 공식으로 해시해 대체한다. 같은 입력이면 항상 같은
+        # apt_id가 나오므로(결정적 함수) 재실행/재집계해도 멱등성이 그대로 유지된다.
+        F.sha2(
+            F.concat_ws(
+                "|",
+                *[
+                    F.coalesce(F.col(f"f.{name}"), F.lit(""))
+                    for name in ("sgg_cd", "dong_cd", "apt_name", "mno", "sno")
+                ],
+            ),
+            256,
+        ).alias("apt_id"),
         F.col("d.apt_name").alias("apt_name"),
         F.col("d.sgg_cd").alias("sgg_cd"),
         F.col("d.sgg_nm").alias("sgg_nm"),

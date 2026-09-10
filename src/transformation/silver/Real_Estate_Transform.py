@@ -72,13 +72,27 @@ FACT_APT_TRANSACTIONS_CURRENT_PATH = f"s3a://{LAKE_BUCKET}/fact_apt_transactions
 
 
 def _export_current_dim_apartment() -> None:
-    """Iceberg 현재 스냅샷을 DuckDB Gold 작업용 Parquet 스냅샷으로 게시한다."""
+    """Iceberg 현재 스냅샷을 DuckDB Gold 작업용 Parquet 스냅샷으로 게시한다.
+
+    [2026-09-10] 이 함수는 두 경로에서 호출된다: (1) 매일 도는 일반 배치(6번 이후, 컷오버
+    전) - 이 시점의 lakehouse.dim_apartment는 apartment_id/mno/sno 컬럼이 물리적으로
+    없다(CREATE TABLE IF NOT EXISTS는 기존 테이블에 무효과이고, 5-5 MERGE INTO도 이
+    3컬럼은 채운 적이 없다 - 위 5-6 주석 참고). (2) _cutover_apartment_key_v2() 완료 직후
+    - 이때는 바로 위에서 dim_apartment가 dim_apartment_v2 스키마로 CREATE OR REPLACE되어
+    이 3컬럼이 실제로 존재한다. 두 경로 모두 이 함수 하나로 지원해야 하므로, desired 목록
+    중 실제로 존재하는 컬럼만 동적으로 선택한다 - 하드코딩하면 컷오버 전에는
+    UNRESOLVED_COLUMN AnalysisException으로 즉시 실패한다(2026-09-09 GCP 운영 환경
+    재현: apt_rtt_mart.py/apt_mkt_trends_mart.py가 소비하는 dim_apartment_current 스냅샷
+    게시 자체가 여기서 죽어 있었다)."""
+    _desired_dim_cols = [
+        "apartment_id", "sgg_cd", "sgg_nm", "dong_cd", "dong_nm",
+        "apt_name", "mno", "sno", "build_year",
+    ]
+    _dim_table = spark.table("lakehouse.dim_apartment")
+    _available_dim_cols = [c for c in _desired_dim_cols if c in _dim_table.columns]
     (
-        spark.table("lakehouse.dim_apartment")
-        .select(
-            "apartment_id", "sgg_cd", "sgg_nm", "dong_cd", "dong_nm",
-            "apt_name", "mno", "sno", "build_year",
-        )
+        _dim_table
+        .select(*_available_dim_cols)
         .write.mode("overwrite")
         .parquet(DIM_APARTMENT_CURRENT_PATH)
     )
@@ -585,12 +599,19 @@ def _process_bronze_partition(bronze_path: str, *, is_bulk: bool, label: str) ->
         silver_df.alias("f")
         .join(
             broadcast(dim_apartment_df).alias("d"),
+            # dim_apartment는 (sgg_cd, dong_cd, apt_name) 3개 컬럼만을 자연키로 MERGE
+            # Upsert된다(위 [MERGE_CARDINALITY_VIOLATION 방어 1] 주석 및 5-5 MERGE INTO ON
+            # 절 참고). dim_apartment 테이블은 mno/sno 컬럼 자체가 없고(운영 환경 실제
+            # Iceberg 물리 스키마에 없음 - 위 CREATE TABLE DDL의 mno/sno/apartment_id는
+            # apartment_key_v2 컷오버 이전까지는 반영되지 않은 목표 스키마일 뿐이다), 설령
+            # 있더라도 5-5 MERGE INTO가 그 값을 채운 적이 없어 항상 NULL이므로, 이 조인
+            # 조건에 f.mno/f.sno를 함께 넣으면 지번이 있는 거래가 전부 미매칭으로 처리되고
+            # (게다가 물리 컬럼 자체가 없어 UNRESOLVED_COLUMN.WITH_SUGGESTION AnalysisException으로
+            # 즉시 실패한다). apartment_key_v2 전환 전까지는 3개 컬럼 키만 사용한다.
             on=[
                 F.col("f.sgg_cd") == F.col("d.sgg_cd"),
                 F.col("f.dong_cd") == F.col("d.dong_cd"),
                 F.col("f.apt_name") == F.col("d.apt_name"),
-                F.coalesce(F.col("f.mno"), F.lit("")) == F.coalesce(F.col("d.mno"), F.lit("")),
-                F.coalesce(F.col("f.sno"), F.lit("")) == F.coalesce(F.col("d.sno"), F.lit("")),
             ],
             # 거래를 기준으로 보존한다. 마스터 미매칭 여부는 아래 품질 상태로 명시한다.
             how="left",
