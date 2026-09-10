@@ -180,6 +180,15 @@ def get_duckdb_connection(config: dict) -> duckdb.DuckDBPyConnection:
         SET threads={threads};
         SET temp_directory='{temp_directory}';
     """)
+    # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응 - apt_mkt_trends_mart.py와 동일
+    # 원인/동일 조치] 이 스크립트는 adaptive_lookback_duckdb.py::run_adaptive_backward_fallback를
+    # apt_mkt_trends_mart.py와 공유한다. dormant_state 캐시 없이 콜드스타트로 도는 경우
+    # (수백~1,095일치를 하루씩 거슬러 올라가며 반복 조회) 그 스크립트에서 실제로
+    # "ArrowBuffer: failed to allocate ... bytes" OOM이 재현됐다 - 이 스크립트도 같은
+    # 함수/같은 반복 조회 패턴을 그대로 쓰므로 조건만 맞으면 동일하게 재현될 수 있다.
+    # DuckDB 기본값(삽입 순서 보존)이 반복 호출마다 중간 결과 버퍼를 계속 붙드는 게
+    # 원인이고, 이 스크립트도 DuckDB 결과의 행 순서에 의존하지 않으므로 선제적으로 꺼둔다.
+    con.execute("SET preserve_insertion_order=false;")
     return con
 
 

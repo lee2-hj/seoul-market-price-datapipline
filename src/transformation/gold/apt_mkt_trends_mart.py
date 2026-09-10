@@ -175,6 +175,20 @@ def get_duckdb_connection(config: dict) -> duckdb.DuckDBPyConnection:
         SET threads={threads};
         SET temp_directory='{temp_directory}';
     """)
+    # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응] 적응형 조회기간 폴백
+    # (run_adaptive_backward_fallback)이 dormant_state 캐시 없이 콜드스타트로 도는 경우
+    # (이번 재현: 3,806개 단지가 전부 캐시 미스라 안전 상한 1,095일까지 하루씩 거슬러
+    # 올라가며 반복 조회해야 했음), interested 집합 재등록을 건너뛰는 최적화(위 호출부
+    # adaptive_lookback_duckdb.py 수정)를 적용해도 여전히 "ArrowBuffer: failed to
+    # allocate ... bytes"로 죽었다. DuckDB는 기본적으로 멀티스레드 파이프라인 실행 결과의
+    # 삽입 순서(insertion order)를 보존하기 위해 중간 결과를 재정렬 가능하도록 메모리에
+    # 붙들고 있는데, 이 스크립트처럼 짧은 조회를 수백~1,000번 넘게 반복하며 매번
+    # Arrow(.pl())로 결과를 뽑아가는 패턴에서는 이 순서 보존 버퍼가 반복 호출마다 계속
+    # 쌓여 메모리를 붙든다(에러 메시지가 스스로 제안하는 "Disabling insertion-order
+    # preservation" 조치와 정확히 일치하는 증상). 이 스크립트/폴백 로직 어디에서도 DuckDB
+    # 결과의 행 순서에 의존하지 않으므로(각 날짜 결과는 그대로 집계/조인/저장될 뿐 순서를
+    # 쓰지 않음) 순서 보존을 꺼서 중간 버퍼를 더 적극적으로 반환하게 한다.
+    con.execute("SET preserve_insertion_order=false;")
     return con
 
 
