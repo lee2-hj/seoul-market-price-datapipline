@@ -29,6 +29,7 @@ dim_apartment 단지"만 추려서 시작일 하루 전(start_date - 1일)부터
 이 폴백이 아예 실행되지 않는다(추가 비용 0).
 """
 
+import gc
 import os
 from datetime import date, datetime, timedelta
 
@@ -310,6 +311,20 @@ def run_adaptive_backward_fallback(
 
         day -= timedelta(days=1)
         extra_days_scanned += 1
+
+        # [2026-09-10 OutOfMemoryException(ArrowBuffer) 대응 - 위 재등록 생략/insertion
+        # order 끄기 조치로도 해결 안 됨] 실측 결과 fact_apt_transactions_current는
+        # 2023-01-29부터 데이터가 있어(약 1,020개 날짜 파티션 중 대부분에 실제 거래 존재),
+        # 콜드스타트 폴백(캐시가 비어 3,806개 단지 전부 탐색 필요)은 대부분의 반복에서
+        # IOException으로 빠르게 건너뛰어지는 게 아니라 실제로 read_parquet+조인+
+        # Arrow(.pl()) 변환을 매번 수행한다. 매 반복이 만드는 DuckDB/Arrow/Polars 결과
+        # 객체가 단순 참조 카운트만으로는 바로 회수되지 않고(C 확장 객체 간 순환 참조는
+        # 파이썬의 세대별 가비지 컬렉터가 나중에야 청소함) 반복 수백 회가 넘도록 계속
+        # 쌓이면서 DuckDB 메모리 추적기가 결국 OOM으로 죽는 것이 실제로 재현됐다. 일정
+        # 주기로 강제 가비지 컬렉션을 돌려 이 지연된 회수를 앞당긴다 - 탐색/폴백 로직이나
+        # 결과에는 전혀 영향이 없다.
+        if extra_days_scanned % 30 == 0:
+            gc.collect()
 
     if searching:
         print(
