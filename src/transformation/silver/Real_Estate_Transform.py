@@ -744,5 +744,35 @@ spark.table("lakehouse.dim_apartment").show(5, truncate=False)
 print("\n===== [VALIDATION] lakehouse.fact_apt_transactions 상위 5건 =====")
 spark.table("lakehouse.fact_apt_transactions").show(5, truncate=False)
 
+# =====================================================================================
+# 8. 스냅샷 정리(expire_snapshots) - [2026-09-10] Iceberg의 MERGE INTO(5-5/5-6)는
+#    copy-on-write로 동작해, 위 5번에서 매 날짜/BULK 처리마다 dim_apartment/
+#    fact_apt_transactions에 새 스냅샷과 데이터 파일을 만들어낸다. 지금까지 이 정규
+#    일일 흐름에는 스냅샷을 만료(expire)시키는 코드가 전혀 없어서(1회성 수동 스크립트
+#    backfill_mno_sno.py에만 있었음), 옛 스냅샷이 참조하던 옛 데이터 파일이 영원히
+#    S3에 그대로 쌓였다. 실측(2026-09-10): dim_apartment는 원본 파일을 그대로 읽으면
+#    약 1,000만 행이 나오는데 실제 유효 단지는 7천여 개뿐(약 1,400배 부풀려짐),
+#    fact_apt_transactions도 같은 거래가 최대 14번까지 중복되어 읽힌다.
+#    pipeline_apt_name.py처럼 Iceberg 메타데이터를 거치지 않고 data/**/*.parquet를
+#    DuckDB/pandas로 직접 글롭해서 읽는 다운스트림 스크립트는 이 부풀려진 원본을 그대로
+#    다 읽어들이므로, 정리하지 않으면 실행할 때마다 메모리 사용량이 계속(무한정) 커진다.
+#    retain_last=1로 "방금 이 실행이 만든 최신 스냅샷 하나만" 남기고, 그 이전 스냅샷들과
+#    그 스냅샷들만 참조하던(이제 어떤 스냅샷도 안 쓰는) 옛 데이터 파일을 이 배치 안에서
+#    바로 정리한다 - backfill_mno_sno.py가 1회성 백필 직후 이미 쓰던 것과 동일한 방식을
+#    매일 도는 정규 흐름에도 반영해, 애초에 다시 쌓이지 않게 한다. 이 정리는 Iceberg
+#    테이블의 SELECT/스키마 조회 등 정상적인 읽기에는 전혀 영향이 없다 - 스냅샷을 몇 개
+#    남기든 "현재 유효한 행"만 돌려주는 건 항상 동일하기 때문이다.
+# =====================================================================================
+print("[INFO] 이전 스냅샷 정리(expire_snapshots) 실행 중...")
+for _table_name in ("lakehouse.dim_apartment", "lakehouse.fact_apt_transactions"):
+    spark.sql(f"""
+        CALL lakehouse.system.expire_snapshots(
+            table => '{_table_name}',
+            older_than => now(),
+            retain_last => 1
+        )
+    """).show(truncate=False)
+print("[INFO] 스냅샷 정리 완료 (원본 데이터 파일 누적 방지)")
+
 _export_current_dim_apartment()
 spark.stop()

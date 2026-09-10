@@ -252,9 +252,27 @@ def run_adaptive_backward_fallback(
 
     day = start_date - timedelta(days=1)
 
+    # [2026-09-10 OOM 대응] dormant_state 캐시가 비어있어(첫 실행 등) missing_keys 전체가
+    # new_missing_keys로 넘어오면, 이 while 루프가 안전 상한(MAX_EXTRA_LOOKBACK_DAYS, 기본
+    # 1095일)까지 하루 단위로 계속 돌 수 있다. 그런데 그 대부분의 날짜는 거래가 아예 없어서
+    # (raw_day_df.height == 0) searching/collecting 집합이 전혀 안 바뀌는데도, 예전 코드는
+    # 매 반복마다 무조건 _register_interested_apts()로 새 Arrow 테이블을 등록 ->
+    # CREATE OR REPLACE TEMP TABLE -> 등록 해제를 반복했다. 이 재등록 자체는 논리적으로
+    # 무해하지만(내용이 같으면 결과도 같음), 이력이 없는 오래된 구간이 수백~1000일 넘게
+    # 이어지는 콜드스타트에서는 이 반복 횟수만큼 DuckDB/Arrow 쪽 임시 객체가 쌓여
+    # "OutOfMemoryException: ArrowBuffer: failed to allocate ... bytes"로 죽는 게 실제로
+    # 재현됐다(2026-09-10, 3,806개 단지가 전부 캐시 미스라 처음부터 끝까지 탐색해야 했던
+    # apt_mkt_trends_mart.py 실행). interested 집합이 실제로 바뀐 경우에만 재등록하도록
+    # 바꿔 이 불필요한 반복 재생성을 없앤다 - 조회 결과(찾아내는 단지/날짜)는 이전과
+    # 완전히 동일하다.
+    _previous_interested: frozenset | None = None
+
     while (searching or collecting) and extra_days_scanned < MAX_EXTRA_LOOKBACK_DAYS:
         interested = searching | set(collecting.keys())
-        _register_interested_apts(con, interested)
+        _interested_frozen = frozenset(interested)
+        if _interested_frozen != _previous_interested:
+            _register_interested_apts(con, interested)
+            _previous_interested = _interested_frozen
 
         raw_day_df = fetch_day_fn(con, lake_bucket, day.strftime("%Y-%m-%d"), filter_table=INTERESTED_APTS_TABLE)
 
