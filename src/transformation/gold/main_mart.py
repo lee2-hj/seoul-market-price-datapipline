@@ -430,8 +430,18 @@ print(
     f"신규 호출 대상 {len(_distinct_apt_rows_to_call)}건"
 )
 
+# [2026-09-10] geocode_schema/아래 values_sql 언패킹은 (sgg_cd, dong_cd, apt_name, latitude,
+# longitude, is_exact_location, mno, sno) 8개 값을 기대하는데, 캐시로 즉시 해결된 쪽은
+# is_exact_location(_persistent_geocode_cache의 value[2])과 mno/sno가 아예 빠진 5-튜플만
+# 만들고 있었다 - ValueError: not enough values to unpack (expected 8, got 5)로 즉시 실패한다
+# (2026-09-10 GCP 운영 환경 재현). is_exact_location은 캐시 값 그대로, mno/sno는
+# jibun_lookup(위 7-1에서 이미 구해둔 단지별 대표 지번)에서 채운다 - dong_pyeong_common.py의
+# 동일 로직(cached_rows.append(...))과 같은 방식이다.
 geocode_rows = [
-    (key[0], key[1], key[2], value[0], value[1])
+    (
+        key[0], key[1], key[2], value[0], value[1], value[2],
+        *jibun_lookup.get(key, (None, None)),
+    )
     for key, value in _resolved_from_cache.items()
 ]
 _newly_geocoded: dict[tuple, tuple] = {}
@@ -439,7 +449,8 @@ for row in _distinct_apt_rows_to_call:
     mno, sno = jibun_lookup.get((row["sgg_cd"], row["dong_cd"], row["apt_name"]), (None, None))
     jibun = _format_jibun(mno, sno)
     latitude, longitude, is_exact = _geocode_apartment(row["sgg_nm"], row["dong_nm"], jibun, row["apt_name"])
-    geocode_rows.append((row["sgg_cd"], row["dong_cd"], row["apt_name"], latitude, longitude))
+    # 위와 같은 이유로 is_exact/mno/sno까지 8-튜플로 채운다.
+    geocode_rows.append((row["sgg_cd"], row["dong_cd"], row["apt_name"], latitude, longitude, is_exact, mno, sno))
     if latitude is not None:
         _newly_geocoded[(row["sgg_cd"], row["dong_cd"], row["apt_name"])] = (latitude, longitude, is_exact)
 
